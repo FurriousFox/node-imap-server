@@ -4,9 +4,10 @@
   "description": "imap implementation in nodejs",
   "keywords": [
     "imap",
+    "imap4",
+    "IMAP4rev1",
     "mail",
-    "pop3",
-    "imap server"
+    "pop3"
   ],
   "homepage": "https://github.com/FurriousFox/node-imap-server#readme",
   "bugs": {
@@ -22,5 +23,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0"
   }
 }
