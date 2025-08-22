@@ -1,7 +1,7 @@
 import net from "node:net";
 import process from "node:process";
 import { Buffer } from "node:buffer";
-import _response, { IMAPSocket } from "./response.ts";
+import _response, { IMAPSocket, continuation } from "./response.ts";
 
 export enum IMAPSecurity {
     NONE = "none",
@@ -134,6 +134,12 @@ export class IMAPServer {
             function tryParse() {
                 const new_line = conn.buffer.indexOf("\r\n");
                 if (new_line == -1) return;
+                if (continuation.flag) {
+                    continuation.callback(conn.buffer.subarray(0, new_line));
+                    conn.buffer = conn.buffer.subarray(new_line + 2);
+                    if (internal_state !== "disconnected") tryParse();
+                    return;
+                }
 
                 const line_parts = conn.buffer.subarray(0, new_line).toString().split(' ');
                 const tag = line_parts.shift();
@@ -154,8 +160,8 @@ export class IMAPServer {
                     const f_q = arg_buffer.indexOf('"', arg_buffer_i);
                     const f_b = arg_buffer.indexOf('{', arg_buffer_i);
 
-                    if (f_s == -1 && f_q == -1 && f_b) break;
-                    if ((f_s + 1 < f_q || f_q == -1) && (f_s + 1 < f_q || f_q == -1)) {
+                    if (f_s == -1 && f_q == -1 && f_b == -1) break;
+                    if ((f_s + 1 < f_q || f_q == -1) && (f_s + 1 < f_b || f_b == -1)) {
                         // there's a space --> it's an atom, number or NIL
                         const s_s = arg_buffer.indexOf(' ', f_s + 1);
                         const arg = arg_buffer.subarray(f_s + 1, s_s == -1 ? undefined : s_s);
@@ -168,6 +174,8 @@ export class IMAPServer {
                         }
 
                         arg_buffer_i = s_s;
+                    } else if ((f_b < f_q || f_q == -1) && f_b !== -1) {
+                        console.log("bracket time", arg_buffer.toString());
                     } else {
                         // there's a quote --> it's a quoted string
                         const s_q = arg_buffer.indexOf('"', f_q + 1);
@@ -189,7 +197,7 @@ export class IMAPServer {
 
                 switch (command) {
                     case "CAPABILITY": // tbd auth=plain, starttls, nologin
-                        socket.write("* CAPABILITY IMAP4rev1\r\n");
+                        socket.write("* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n");
                         socket.write(`${tag} OK OK\r\n`);
                         break;
                     case "NOOP": // tbd: status updates, e.g.
@@ -223,21 +231,82 @@ export class IMAPServer {
                             text: "TLS unsupported",
                         });
                         break;
-                    case "AUTHENTICATE": // tbd plain auth (+ literal)
-                        // if (args[0] == "PLAIN") {
-                        //     writeResponse({
-                        //         tag: tag,
-                        //         type: "OK",
-                        //     });
-                        // } else writeResponse({
-                        //     tag: tag,
-                        //     type: "NO",
-                        //     text: "only plain auth (LOGIN) supported",
-                        // });
-                        writeResponse({
+                    case "AUTHENTICATE":
+                        if (args[0] == "PLAIN") {
+                            writeResponse({
+                                type: "CONTINUE-REQ",
+                            }).then((_buffer) => {
+                                const buffer = _buffer as Buffer;
+                                const b64d = Buffer.from(buffer.toString(), "base64");
+                                const f_z = b64d.indexOf("\0");
+                                const s_z = b64d.indexOf("\0", f_z + 1);
+
+                                if (handlers.login) {
+                                    switch (handlers.login({
+                                        connection: connection,
+                                        username: b64d.subarray(f_z + 1, s_z).toString(),
+                                        password: b64d.subarray(s_z + 1).toString()
+                                    }, {
+                                        accept: (reason) => {
+                                            if (!a) writeResponse({
+                                                tag: tag,
+                                                type: "OK",
+                                                text: reason
+                                            });
+                                            a = true;
+                                        },
+                                        reject: (reason) => {
+                                            if (!a) writeResponse({
+                                                tag: tag,
+                                                type: "NO",
+                                                text: reason
+                                            });
+                                            a = true;
+                                        }
+                                    })) {
+                                        case true:
+                                            if (!a) writeResponse({
+                                                tag: tag,
+                                                type: "OK"
+                                            });
+                                            break;
+                                        case false:
+                                            if (!a) writeResponse({
+                                                tag: tag,
+                                                type: "NO"
+                                            });
+                                            break;
+                                    }
+                                } else {
+                                    if (internal_state == "unauth") {
+                                        writeResponse({
+                                            tag: tag,
+                                            type: "NO",
+                                            text: "unable to authenticate"
+                                        });
+                                    } else {
+                                        writeResponse({
+                                            tag: tag,
+                                            type: "OK",
+                                            text: "already authenticated"
+                                        });
+                                    }
+                                }
+                            });
+
+                            // writeResponse({
+                            //     tag: tag,
+                            //     type: "OK",
+                            // });
+                        } else writeResponse({
                             tag: tag,
-                            type: "NO"
+                            type: "NO",
+                            text: "unsupported auth mechanism",
                         });
+                        // writeResponse({
+                        //     tag: tag,
+                        //     type: "NO"
+                        // });
                         break;
                     case "LOGIN":
                         if (handlers.login) {
