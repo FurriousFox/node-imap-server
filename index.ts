@@ -37,7 +37,7 @@ export interface IMAPServerHandlers {
         connection: IMAPConnection;
     }, action: {}) => any;
 
-    login?: (event: {
+    auth?: (event: {
         connection: IMAPConnection;
         username: string;
         password: string;
@@ -146,50 +146,100 @@ export class IMAPServer {
                 const command = line_parts.shift()?.toUpperCase();
                 // const args = line_parts;
 
-                const args_buffer: Buffer[] = [];
-                const args_string: string[] = [];
-                type args = (Buffer | string | number | null | args)[];
-                const args: args = [];
-                const arg_start = conn.buffer.indexOf(" ", conn.buffer.indexOf(" ") + 1);
-                const arg_buffer = conn.buffer.subarray(arg_start == 0 ? new_line : arg_start, new_line);
-                let arg_buffer_i = 0;
-                // console.log(arg_buffer.toString());
-                let m = 0;
-                while (m++ < 4096) {
-                    const f_s = arg_buffer.indexOf(' ', arg_buffer_i);
-                    const f_q = arg_buffer.indexOf('"', arg_buffer_i);
-                    const f_b = arg_buffer.indexOf('{', arg_buffer_i);
+                function argParse(conn: { buffer: Buffer; } | { f_buffer: Buffer; f_c?: boolean, f_r?: boolean; }) {
+                    const args_buffer: Buffer[] = [];
+                    const args_string: string[] = [];
+                    type args = (Buffer | string | number | null | args | Set<string | args>)[];
+                    const args: args = [];
+                    const arg_start = 'f_buffer' in conn ? 0 : conn.buffer.indexOf(" ", conn.buffer.indexOf(" ") + 1);
+                    const arg_buffer = 'f_buffer' in conn ? conn.f_buffer : conn.buffer.subarray(arg_start == 0 ? new_line : arg_start, new_line);
+                    let arg_buffer_i = 0;
+                    // console.log(arg_buffer.toString());
+                    let m = 0;
+                    while (m++ < 4096) {
+                        const f_s = arg_buffer.indexOf(' ', arg_buffer_i);
+                        const f_q = arg_buffer.indexOf('"', arg_buffer_i);
+                        const f_b = arg_buffer.indexOf('{', arg_buffer_i);
+                        const f_c = arg_buffer.indexOf('(', arg_buffer_i);
+                        const f_r = arg_buffer.indexOf('[', arg_buffer_i);
 
-                    if (f_s == -1 && f_q == -1 && f_b == -1) break;
-                    if ((f_s + 1 < f_q || f_q == -1) && (f_s + 1 < f_b || f_b == -1)) {
-                        // there's a space --> it's an atom, number or NIL
-                        const s_s = arg_buffer.indexOf(' ', f_s + 1);
-                        const arg = arg_buffer.subarray(f_s + 1, s_s == -1 ? undefined : s_s);
-                        const arg_string = arg.toString();
-                        args_buffer.push(arg);
-                        if (arg_string.toUpperCase() == "NIL") args.push(null);
-                        else {
-                            if (arg.findIndex(e => (e < 48 || e > 57)) == -1) /* number */ args.push(+arg.toString());
-                            else /* atom */ args.push(arg.toString());
+                        // console.log(f_s, f_q, f_b, f_c);
+
+                        if (f_s == -1 && f_q == -1 && f_b == -1 && f_c == -1) break;
+                        if ((f_s + 1 < f_q || f_q == -1) && (f_s + 1 < f_b || f_b == -1) && (f_s + 1 < f_c || f_c == -1) && f_s !== -1) {
+                            // there's a space --> it's an atom, number or NIL
+                            const s_s = arg_buffer.indexOf(' ', f_s + 1);
+                            let arg = arg_buffer.subarray(f_s + 1, s_s == -1 ? undefined : s_s);
+                            if (!arg.toString().trim().length) break;
+
+                            if (f_r !== -1 && (f_r < s_s || s_s == -1)) {
+                                let farg = arg_buffer.subarray(f_s + 1, f_r).toString();
+                                let sarg = Buffer.concat([Buffer.from(" "), arg_buffer.subarray(f_r + 1, arg_buffer.indexOf(']', arg_buffer_i))]);
+                                // console.log("sarg2", f_r + 1, arg_buffer.indexOf(']', arg_buffer_i), sarg.toString());
+
+                                let parg = argParse({ f_buffer: sarg, f_c: true });
+                                args.push(new Set([farg, parg.args]));
+                                arg_buffer_i = f_c + 1 + parg.arg_i;
+                            } else {
+                                if ('f_c' in conn && arg.at(-1) == 41) arg = arg.subarray(0, -1);
+                                const arg_string = arg.toString();
+                                args_buffer.push(arg);
+                                if (arg_string.toUpperCase() == "NIL") args.push(null);
+                                else {
+                                    if (arg.findIndex(e => (e < 48 || e > 57)) == -1) /* number */ args.push(+arg.toString());
+                                    else /* atom */ args.push(arg.toString());
+                                }
+                            }
+
+                            arg_buffer_i = s_s == -1 ? arg_buffer.length : s_s;
+                        } else if ((f_b < f_q || f_q == -1) && (f_b < f_c || f_c == -1) && f_b !== -1) {
+                            // literally a literal
+                            console.log("bracket time", arg_buffer.toString());
+                            process.exit(1);
+                        } else if ((f_c < f_q || f_q == -1) && f_c !== -1) {
+                            // parenthesized list
+                            // console.log("list time", arg_buffer.toString());
+                            // const s_c = arg_buffer.indexOf("(");
+                            // const f_p = arg_buffer.indexOf(")");
+                            // tbd, checks that s_p and f_p aren't inside a literal
+
+                            // tbd: check whether there really is a second quote
+
+                            let sarg = Buffer.concat([Buffer.from(" "), arg_buffer.subarray(f_c + 1)]);
+
+                            let parg = argParse({ f_buffer: sarg, f_c: true });
+                            args.push(parg.args);
+                            arg_buffer_i = f_c + 1 + parg.arg_i;
+                            // console.log("", args);
+
+                            // process.exit(1);
+                        } else if (f_q !== -1) {
+                            // there's a quote --> it's a quoted string
+
+                            // tbd: check whether there really is a second quote
+                            const s_q = arg_buffer.indexOf('"', f_q + 1);
+                            const arg = arg_buffer.subarray(f_q + 1, s_q);
+                            args_buffer.push(arg);
+                            args.push(arg.toString());
+
+                            arg_buffer_i = s_q + 1;
+                        } else {
+                            console.log(`uhh? can't parse ${arg_buffer.toString()}`);
+                            process.exit(1);
                         }
 
-                        arg_buffer_i = s_s;
-                    } else if ((f_b < f_q || f_q == -1) && f_b !== -1) {
-                        console.log("bracket time", arg_buffer.toString());
-                    } else {
-                        // there's a quote --> it's a quoted string
-                        const s_q = arg_buffer.indexOf('"', f_q + 1);
-                        const arg = arg_buffer.subarray(f_q + 1, s_q);
-                        args_buffer.push(arg);
-                        args.push(arg.toString());
-
-                        arg_buffer_i = s_q + 1;
+                        if (arg_buffer_i >= arg_buffer.length) break;
                     }
+                    if (m > 4095) {
+                        console.log(`arg structure too complex: ${arg_buffer.toString()}`);
+                        process.exit(1);
+                    }
+                    args_buffer.forEach(e => args_string.push(e.toString()));
 
-                    if (arg_buffer_i >= arg_buffer.length) break;
+                    return { args_buffer, args_string, args, arg_i: arg_buffer_i };
                 }
-                args_buffer.forEach(e => args_string.push(e.toString()));
-                console.log(args);
+                const { args_buffer, args_string, args } = argParse(conn);
+                console.log(tag, command, args);
 
                 if (internal_state == "disconnected") return;
 
@@ -241,8 +291,8 @@ export class IMAPServer {
                                 const f_z = b64d.indexOf("\0");
                                 const s_z = b64d.indexOf("\0", f_z + 1);
 
-                                if (handlers.login) {
-                                    switch (handlers.login({
+                                if (handlers.auth) {
+                                    switch (handlers.auth({
                                         connection: connection,
                                         username: b64d.subarray(f_z + 1, s_z).toString(),
                                         password: b64d.subarray(s_z + 1).toString()
@@ -309,8 +359,13 @@ export class IMAPServer {
                         // });
                         break;
                     case "LOGIN":
-                        if (handlers.login) {
-                            switch (handlers.login({
+                        if (typeof args[0] !== "string" || typeof args[1] !== "string") {
+                            writeResponse({
+                                tag: tag,
+                                type: "BAD"
+                            });
+                        } else if (handlers.auth) {
+                            switch (handlers.auth({
                                 connection: connection,
                                 username: args[0],
                                 password: args[1]
@@ -454,8 +509,10 @@ export class IMAPServer {
                         break;
                     case "FETCH":
                         const sequence_set = args.shift();
-                        console.log(sequence_set);
-                        if (sequence_set == undefined) {
+                        // console.log(sequence_set);
+
+                        const details = args.shift();
+                        if (!(details instanceof Array) || typeof sequence_set !== "string") {
                             writeResponse({
                                 tag: tag,
                                 type: "BAD"
@@ -473,10 +530,8 @@ export class IMAPServer {
                         }).flat();
                         console.log(seq);
 
-                        console.log(args.join(" "));
-
                         for (const se of seq) {
-                            if (!args.join(" ").includes(".SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
+                            if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
                             else {
                                         /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
                                 // break;
@@ -504,7 +559,18 @@ export class IMAPServer {
                     case "UID":
                         // let g = args.shift()?.toLowerCase();
                         // console.log(args);
-                        switch (args.shift()?.toLowerCase()) {
+
+                        const type = args.shift();
+                        // console.log(type);
+                        if (typeof type !== "string") {
+                            writeResponse({
+                                tag: tag,
+                                type: "BAD"
+                            });
+                            break;
+                        }
+
+                        switch (type.toLowerCase()) {
                             case "copy":
                                 // copy implementation
                                 writeResponse({
@@ -514,8 +580,10 @@ export class IMAPServer {
                                 break;
                             case "fetch":
                                 const sequence_set = args.shift();
-                                console.log(sequence_set);
-                                if (sequence_set == undefined) {
+                                // console.log(sequence_set);
+
+                                const details = args.shift();
+                                if (!(details instanceof Array) || typeof sequence_set !== "string") {
                                     writeResponse({
                                         tag: tag,
                                         type: "BAD"
@@ -533,10 +601,8 @@ export class IMAPServer {
                                 }).flat();
                                 console.log(seq);
 
-                                console.log(args.join(" "));
-
                                 for (const se of seq) {
-                                    if (!args.join(" ").includes(".SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
+                                    if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
                                     else {
                                         /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
                                         // break;

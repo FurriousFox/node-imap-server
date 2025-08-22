@@ -11,7 +11,7 @@ new IMAPServer({
         action.requireLogin();
     },
 
-    login(event, action) {
+    auth(event, action) {
         if (crypto.hash("sha512", Buffer.concat([
             Buffer.from(event.username),
             Buffer.from("+e4963616-97cc-420f-acaf-03ecc19abf9b+"),
