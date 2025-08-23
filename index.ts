@@ -1,7 +1,7 @@
 import net from "node:net";
 import process from "node:process";
 import { Buffer } from "node:buffer";
-import _response, { IMAPSocket, continuation } from "./response.ts";
+import _response, { IMAPSocket } from "./response.ts";
 
 export enum IMAPSecurity {
     NONE = "none",
@@ -80,6 +80,9 @@ export class IMAPServer {
             socket.writeResponse = _response.bind(socket);
             const writeResponse = socket.writeResponse!;
 
+            socket.continuation = { flag: false };
+            const continuation = socket.continuation;
+
             const connection: IMAPConnection = {
                 source: {
                     port: socket.remotePort!,
@@ -135,7 +138,7 @@ export class IMAPServer {
                 const new_line = conn.buffer.indexOf("\r\n");
                 if (new_line == -1) return;
                 if (continuation.flag) {
-                    continuation.callback(conn.buffer.subarray(0, new_line));
+                    (continuation as unknown as { readonly flag: true; readonly callback: (buffer: Buffer) => void; }).callback(conn.buffer.subarray(0, new_line));
                     conn.buffer = conn.buffer.subarray(new_line + 2);
                     if (internal_state !== "disconnected") tryParse();
                     return;
@@ -143,10 +146,10 @@ export class IMAPServer {
 
                 const line_parts = conn.buffer.subarray(0, new_line).toString().split(' ');
                 const tag = line_parts.shift();
-                const command = line_parts.shift()?.toUpperCase();
+                let command = line_parts.shift()?.toUpperCase();
                 // const args = line_parts;
 
-                function argParse(conn: { buffer: Buffer; } | { f_buffer: Buffer; f_c?: boolean, f_r?: boolean; }) {
+                function argParse(conn: { buffer: Buffer; } | { f_buffer: Buffer; f_c?: boolean | number; _m: { c: number; }; }) {
                     const args_buffer: Buffer[] = [];
                     const args_string: string[] = [];
                     type args = (Buffer | string | number | null | args | Set<string | args>)[];
@@ -155,16 +158,19 @@ export class IMAPServer {
                     const arg_buffer = 'f_buffer' in conn ? conn.f_buffer : conn.buffer.subarray(arg_start == 0 ? new_line : arg_start, new_line);
                     let arg_buffer_i = 0;
                     // console.log(arg_buffer.toString());
-                    let m = 0;
-                    while (m++ < 4096) {
+                    let m: { c: number; } = '_m' in conn ? conn._m : { c: 0 };
+
+                    while (m.c++ < 4096) {
                         const f_s = arg_buffer.indexOf(' ', arg_buffer_i);
                         const f_q = arg_buffer.indexOf('"', arg_buffer_i);
                         const f_b = arg_buffer.indexOf('{', arg_buffer_i);
                         const f_c = arg_buffer.indexOf('(', arg_buffer_i);
                         const f_r = arg_buffer.indexOf('[', arg_buffer_i);
+                        const f_d = arg_buffer.indexOf(')', arg_buffer_i);
 
                         // console.log(f_s, f_q, f_b, f_c);
 
+                        if (f_d == arg_buffer_i) { arg_buffer_i++; break; }
                         if (f_s == -1 && f_q == -1 && f_b == -1 && f_c == -1) break;
                         if ((f_s + 1 < f_q || f_q == -1) && (f_s + 1 < f_b || f_b == -1) && (f_s + 1 < f_c || f_c == -1) && f_s !== -1) {
                             // there's a space --> it's an atom, number or NIL
@@ -177,11 +183,21 @@ export class IMAPServer {
                                 let sarg = Buffer.concat([Buffer.from(" "), arg_buffer.subarray(f_r + 1, arg_buffer.indexOf(']', arg_buffer_i))]);
                                 // console.log("sarg2", f_r + 1, arg_buffer.indexOf(']', arg_buffer_i), sarg.toString());
 
-                                let parg = argParse({ f_buffer: sarg, f_c: true });
+                                let parg = argParse({ f_buffer: sarg, f_c: true, _m: m });
+                                if (farg == "BODY.PEEK" || farg == "BODY") {
+                                    parg.args = parg.args.map((e, f, g) => {
+                                        if (g[f + 1] instanceof Array && typeof e == "string") return new Set([e, g[f + 1] as args]);
+                                        else return e;
+                                    }).filter((e, f, g) => !(e instanceof Array && g[f - 1] instanceof Set));
+                                }
+
                                 args.push(new Set([farg, parg.args]));
-                                arg_buffer_i = f_c + 1 + parg.arg_i;
+                                arg_buffer_i = f_r + 1 + parg.arg_i + 1;
+                                // console.log(arg_buffer_i, arg_buffer.length, JSON.stringify(arg_buffer.toString()));
+
+                                if ('f_c' in conn && arg_buffer.at(arg_buffer_i) == 41) { arg_buffer_i++; break; }
                             } else {
-                                if ('f_c' in conn && arg.at(-1) == 41) arg = arg.subarray(0, -1);
+                                if ('f_c' in conn && arg.at(-1) == 41) { conn.f_c = 2; arg = arg.subarray(0, -1); }
                                 const arg_string = arg.toString();
                                 args_buffer.push(arg);
                                 if (arg_string.toUpperCase() == "NIL") args.push(null);
@@ -189,9 +205,11 @@ export class IMAPServer {
                                     if (arg.findIndex(e => (e < 48 || e > 57)) == -1) /* number */ args.push(+arg.toString());
                                     else /* atom */ args.push(arg.toString());
                                 }
-                            }
 
-                            arg_buffer_i = s_s == -1 ? arg_buffer.length : s_s;
+                                arg_buffer_i = s_s == -1 ? arg_buffer.length : s_s;
+
+                                if ('f_c' in conn && conn.f_c == 2) break;
+                            }
                         } else if ((f_b < f_q || f_q == -1) && (f_b < f_c || f_c == -1) && f_b !== -1) {
                             // literally a literal
                             console.log("bracket time", arg_buffer.toString());
@@ -201,13 +219,13 @@ export class IMAPServer {
                             // console.log("list time", arg_buffer.toString());
                             // const s_c = arg_buffer.indexOf("(");
                             // const f_p = arg_buffer.indexOf(")");
-                            // tbd, checks that s_p and f_p aren't inside a literal
+                            // tbd, checks that s_p and f_p aren't inside a literal or string, 
 
-                            // tbd: check whether there really is a second quote
+                            // tbd: check whether there really is a second parenthesis (you pick up the entire rest of the buffer after the first “(” and feed it to the recursive call; you don’t stop at the matching “)”)
 
                             let sarg = Buffer.concat([Buffer.from(" "), arg_buffer.subarray(f_c + 1)]);
 
-                            let parg = argParse({ f_buffer: sarg, f_c: true });
+                            let parg = argParse({ f_buffer: sarg, f_c: true, _m: m });
                             args.push(parg.args);
                             arg_buffer_i = f_c + 1 + parg.arg_i;
                             // console.log("", args);
@@ -230,7 +248,7 @@ export class IMAPServer {
 
                         if (arg_buffer_i >= arg_buffer.length) break;
                     }
-                    if (m > 4095) {
+                    if (m.c > 4095) {
                         console.log(`arg structure too complex: ${arg_buffer.toString()}`);
                         process.exit(1);
                     }
@@ -245,8 +263,11 @@ export class IMAPServer {
 
                 let a = false;
 
+
+                let _is_uid = false;
+                if (command == "UID" && typeof args[0] == "string") if (args[0].toUpperCase() === "COPY" || args[0].toUpperCase() === "FETCH" || args[0].toUpperCase() === "STORE" || args[0].toUpperCase() === "SEARCH") _is_uid = true, command = (args.shift() as string).toUpperCase();
                 switch (command) {
-                    case "CAPABILITY": // tbd auth=plain, starttls, nologin
+                    case "CAPABILITY": // tbd starttls, nologin
                         socket.write("* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n");
                         socket.write(`${tag} OK OK\r\n`);
                         break;
@@ -282,7 +303,7 @@ export class IMAPServer {
                         });
                         break;
                     case "AUTHENTICATE":
-                        if (args[0] == "PLAIN") {
+                        if (args[0] === "PLAIN") {
                             writeResponse({
                                 type: "CONTINUE-REQ",
                             }).then((_buffer) => {
@@ -508,11 +529,12 @@ export class IMAPServer {
                         });
                         break;
                     case "FETCH":
+                        console.log("is_uid", _is_uid);
                         const sequence_set = args.shift();
                         // console.log(sequence_set);
 
                         const details = args.shift();
-                        if (!(details instanceof Array) || typeof sequence_set !== "string") {
+                        if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
                             writeResponse({
                                 tag: tag,
                                 type: "BAD"
@@ -520,7 +542,7 @@ export class IMAPServer {
                             break;
                         }
 
-                        const seq = sequence_set.split(",").map(e => {
+                        const seq = sequence_set.toString().split(",").map(e => {
                             if (e.includes(":")) {
                                 const g = e.split(":").map(e => e == "*" ? 10 : +e);
                                 return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
@@ -556,85 +578,85 @@ export class IMAPServer {
                             type: "OK"
                         });
                         break;
-                    case "UID":
-                        // let g = args.shift()?.toLowerCase();
-                        // console.log(args);
+                    // case "UID":
+                    //     // let g = args.shift()?.toLowerCase();
+                    //     // console.log(args);
 
-                        const type = args.shift();
-                        // console.log(type);
-                        if (typeof type !== "string") {
-                            writeResponse({
-                                tag: tag,
-                                type: "BAD"
-                            });
-                            break;
-                        }
+                    //     const type = args.shift();
+                    //     // console.log(type);
+                    //     if (typeof type !== "string") {
+                    //         writeResponse({
+                    //             tag: tag,
+                    //             type: "BAD"
+                    //         });
+                    //         break;
+                    //     }
 
-                        switch (type.toLowerCase()) {
-                            case "copy":
-                                // copy implementation
-                                writeResponse({
-                                    tag: tag,
-                                    type: "OK"
-                                });
-                                break;
-                            case "fetch":
-                                const sequence_set = args.shift();
-                                // console.log(sequence_set);
+                    //     switch (type.toLowerCase()) {
+                    //         case "copy":
+                    //             // copy implementation
+                    //             writeResponse({
+                    //                 tag: tag,
+                    //                 type: "OK"
+                    //             });
+                    //             break;
+                    //         case "fetch":
+                    //             const sequence_set = args.shift();
+                    //             // console.log(sequence_set);
 
-                                const details = args.shift();
-                                if (!(details instanceof Array) || typeof sequence_set !== "string") {
-                                    writeResponse({
-                                        tag: tag,
-                                        type: "BAD"
-                                    });
-                                    break;
-                                }
+                    //             const details = args.shift();
+                    //             if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
+                    //                 writeResponse({
+                    //                     tag: tag,
+                    //                     type: "BAD"
+                    //                 });
+                    //                 break;
+                    //             }
 
-                                const seq = sequence_set.split(",").map(e => {
-                                    if (e.includes(":")) {
-                                        const g = e.split(":").map(e => e == "*" ? 10 : +e);
-                                        return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
-                                    } else {
-                                        return +e;
-                                    }
-                                }).flat();
-                                console.log(seq);
+                    //             const seq = sequence_set.toString().split(",").map(e => {
+                    //                 if (e.includes(":")) {
+                    //                     const g = e.split(":").map(e => e == "*" ? 10 : +e);
+                    //                     return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
+                    //                 } else {
+                    //                     return +e;
+                    //                 }
+                    //             }).flat();
+                    //             console.log(seq);
 
-                                for (const se of seq) {
-                                    if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
-                                    else {
-                                        /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
-                                        // break;
-                                    }
-                                }
+                    //             for (const se of seq) {
+                    //                 if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
+                    //                 else {
+                    //                     /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
+                    //                     // break;
+                    //                 }
+                    //             }
 
 
-                                writeResponse({
-                                    tag: tag,
-                                    type: "OK"
-                                });
-                                break;
-                            case "store":
-                                writeResponse({
-                                    tag: tag,
-                                    type: "OK"
-                                });
-                                break;
-                            case "search":
-                                writeResponse({
-                                    tag: tag,
-                                    type: "OK"
-                                });
-                                break;
-                            default:
-                                writeResponse({
-                                    tag: tag,
-                                    type: "BAD"
-                                });
-                                break;
-                        }
-                        break;
+                    //             writeResponse({
+                    //                 tag: tag,
+                    //                 type: "OK"
+                    //             });
+                    //             break;
+                    //         case "store":
+                    //             writeResponse({
+                    //                 tag: tag,
+                    //                 type: "OK"
+                    //             });
+                    //             break;
+                    //         case "search":
+                    //             writeResponse({
+                    //                 tag: tag,
+                    //                 type: "OK"
+                    //             });
+                    //             break;
+                    //         default:
+                    //             writeResponse({
+                    //                 tag: tag,
+                    //                 type: "BAD"
+                    //             });
+                    //             break;
+                    //     }
+                    //     break;
 
                     // case ""
 
