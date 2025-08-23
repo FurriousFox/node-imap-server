@@ -54,6 +54,10 @@ export interface IMAPServerHandlers {
     }) => any;
 }
 
+function astring(nstring: null | number | string) {
+    return nstring?.toString() ?? "NIL";
+}
+
 export class IMAPServer {
     #options: IMAPServerOptions;
     handlers: IMAPServerHandlers;
@@ -149,7 +153,7 @@ export class IMAPServer {
                 let command = line_parts.shift()?.toUpperCase();
                 // const args = line_parts;
 
-                function argParse(conn: { buffer: Buffer; } | { f_buffer: Buffer; f_c?: boolean | number; _m: { c: number; }; }) {
+                function argParse(conn: { buffer: Buffer; } | { f_buffer: Buffer; f_c?: boolean | number; f_g?: boolean, _m: { c: number; }; }) {
                     const args_buffer: Buffer[] = [];
                     const args_string: string[] = [];
                     type args = (Buffer | string | number | null | args | Set<string | args>)[];
@@ -178,18 +182,16 @@ export class IMAPServer {
                             let arg = arg_buffer.subarray(f_s + 1, s_s == -1 ? undefined : s_s);
                             if (!arg.toString().trim().length) break;
 
-                            if (f_r !== -1 && (f_r < s_s || s_s == -1)) {
+                            if (f_r !== -1 && (f_r < s_s || s_s == -1) && (arg_buffer.subarray(f_s + 1, f_r).toString() == "BODY.PEEK" || arg_buffer.subarray(f_s + 1, f_r).toString() == "BODY")) {
                                 let farg = arg_buffer.subarray(f_s + 1, f_r).toString();
                                 let sarg = Buffer.concat([Buffer.from(" "), arg_buffer.subarray(f_r + 1, arg_buffer.indexOf(']', arg_buffer_i))]);
                                 // console.log("sarg2", f_r + 1, arg_buffer.indexOf(']', arg_buffer_i), sarg.toString());
 
                                 let parg = argParse({ f_buffer: sarg, f_c: true, _m: m });
-                                if (farg == "BODY.PEEK" || farg == "BODY") {
-                                    parg.args = parg.args.map((e, f, g) => {
-                                        if (g[f + 1] instanceof Array && typeof e == "string") return new Set([e, g[f + 1] as args]);
-                                        else return e;
-                                    }).filter((e, f, g) => !(e instanceof Array && g[f - 1] instanceof Set));
-                                }
+                                parg.args = parg.args.map((e, f, g) => {
+                                    if (g[f + 1] instanceof Array && typeof e == "string") return new Set([e, g[f + 1] as args]);
+                                    else return e;
+                                }).filter((e, f, g) => !(e instanceof Array && g[f - 1] instanceof Set));
 
                                 args.push(new Set([farg, parg.args]));
                                 arg_buffer_i = f_r + 1 + parg.arg_i + 1;
@@ -200,6 +202,8 @@ export class IMAPServer {
                                 if ('f_c' in conn && arg.at(-1) == 41) { conn.f_c = 2; arg = arg.subarray(0, -1); }
                                 const arg_string = arg.toString();
                                 args_buffer.push(arg);
+
+                                // parsed as nstring by default
                                 if (arg_string.toUpperCase() == "NIL") args.push(null);
                                 else {
                                     if (arg.findIndex(e => (e < 48 || e > 57)) == -1) /* number */ args.push(+arg.toString());
@@ -235,21 +239,37 @@ export class IMAPServer {
                             // there's a quote --> it's a quoted string
 
                             // tbd: check whether there really is a second quote
-                            const s_q = arg_buffer.indexOf('"', f_q + 1);
+                            let s_q: number | undefined = undefined;
+                            while (m.c++ < 4096) {
+                                s_q = arg_buffer.indexOf('"', s_q ? s_q + 1 : f_q + 1);
+
+                                let g = 1;
+                                let flag = false;
+                                while (g < arg_buffer.length) {
+                                    if (arg_buffer[s_q - g] !== 92)
+                                        if (g % 2) { flag = true; break; }
+                                        else { flag = false; break; }
+
+                                    g++;
+                                }
+                                if (flag) break;
+                            }
+                            if (m.c > 4095) break;
+
                             const arg = arg_buffer.subarray(f_q + 1, s_q);
                             args_buffer.push(arg);
-                            args.push(arg.toString());
+                            args.push(arg.toString().replace(/\\(.)/g, "$1"));
 
-                            arg_buffer_i = s_q + 1;
+                            arg_buffer_i = s_q! + 1;
                         } else {
-                            console.log(`uhh? can't parse ${arg_buffer.toString()}`);
+                            console.error(`uhh? can't parse ${arg_buffer.toString()}`);
                             process.exit(1);
                         }
 
                         if (arg_buffer_i >= arg_buffer.length) break;
                     }
-                    if (m.c > 4095) {
-                        console.log(`arg structure too complex: ${arg_buffer.toString()}`);
+                    if (m.c >= 4095) {
+                        console.error(`arg structure too complex: ${arg_buffer.toString()}`);
                         process.exit(1);
                     }
                     args_buffer.forEach(e => args_string.push(e.toString()));
@@ -263,422 +283,465 @@ export class IMAPServer {
 
                 let a = false;
 
+                try {
+                    let _is_uid = false;
+                    if (command == "UID" && typeof args[0] == "string") if (args[0].toUpperCase() === "COPY" || args[0].toUpperCase() === "FETCH" || args[0].toUpperCase() === "STORE" || args[0].toUpperCase() === "SEARCH") _is_uid = true, command = (args.shift() as string).toUpperCase();
+                    switch (command) {
+                        case "CAPABILITY":
+                            if (args.length !== 0) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 0)` });
+                                break;
+                            }
 
-                let _is_uid = false;
-                if (command == "UID" && typeof args[0] == "string") if (args[0].toUpperCase() === "COPY" || args[0].toUpperCase() === "FETCH" || args[0].toUpperCase() === "STORE" || args[0].toUpperCase() === "SEARCH") _is_uid = true, command = (args.shift() as string).toUpperCase();
-                switch (command) {
-                    case "CAPABILITY": // tbd starttls, nologin
-                        socket.write("* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n");
-                        socket.write(`${tag} OK OK\r\n`);
-                        break;
-                    case "NOOP": // tbd: status updates, e.g.
-                        /*
-                            S: * 22 EXPUNGE
-                            S: * 23 EXISTS
-                            S: * 3 RECENT
-                            S: * 14 FETCH (FLAGS (\Seen \Deleted))
-                        */
-
-                        socket.write(`${tag} OK OK\r\n`);
-                        break;
-                    case "LOGOUT": // FULLY IMPLEMENTED
-                        if (handlers.close) handlers.close({ connection }, {});
-
-                        writeResponse({
-                            type: "BYE",
-                            text: "logout",
-                        });
-                        writeResponse({
-                            tag: tag,
-                            type: "OK",
-                        });
-                        socket.end();
-                        internal_state = "disconnected";
-                        break;
-                    case "STARTTLS": // tbd implement starttls (and tls itself lol)
-                        writeResponse({
-                            tag: tag,
-                            type: "BAD",
-                            text: "TLS unsupported",
-                        });
-                        break;
-                    case "AUTHENTICATE":
-                        if (args[0] === "PLAIN") {
+                            // tbd starttls (should only advertise when still in unauth state), nologin (+ remove AUTH=PLAIN) (option to disallow logins over insecure connections)
                             writeResponse({
-                                type: "CONTINUE-REQ",
-                            }).then((_buffer) => {
-                                const buffer = _buffer as Buffer;
-                                const b64d = Buffer.from(buffer.toString(), "base64");
-                                const f_z = b64d.indexOf("\0");
-                                const s_z = b64d.indexOf("\0", f_z + 1);
-
-                                if (handlers.auth) {
-                                    switch (handlers.auth({
-                                        connection: connection,
-                                        username: b64d.subarray(f_z + 1, s_z).toString(),
-                                        password: b64d.subarray(s_z + 1).toString()
-                                    }, {
-                                        accept: (reason) => {
-                                            if (!a) writeResponse({
-                                                tag: tag,
-                                                type: "OK",
-                                                text: reason
-                                            });
-                                            a = true;
-                                        },
-                                        reject: (reason) => {
-                                            if (!a) writeResponse({
-                                                tag: tag,
-                                                type: "NO",
-                                                text: reason
-                                            });
-                                            a = true;
-                                        }
-                                    })) {
-                                        case true:
-                                            if (!a) writeResponse({
-                                                tag: tag,
-                                                type: "OK"
-                                            });
-                                            break;
-                                        case false:
-                                            if (!a) writeResponse({
-                                                tag: tag,
-                                                type: "NO"
-                                            });
-                                            break;
-                                    }
-                                } else {
-                                    if (internal_state == "unauth") {
-                                        writeResponse({
-                                            tag: tag,
-                                            type: "NO",
-                                            text: "unable to authenticate"
-                                        });
-                                    } else {
-                                        writeResponse({
-                                            tag: tag,
-                                            type: "OK",
-                                            text: "already authenticated"
-                                        });
-                                    }
-                                }
+                                type: "CAPABILITY",
+                                capabilities: [
+                                    "IMAP4rev1",
+                                    // "AUTH=PLAIN"
+                                ]
                             });
 
-                            // writeResponse({
-                            //     tag: tag,
-                            //     type: "OK",
-                            // });
-                        } else writeResponse({
-                            tag: tag,
-                            type: "NO",
-                            text: "unsupported auth mechanism",
-                        });
-                        // writeResponse({
-                        //     tag: tag,
-                        //     type: "NO"
-                        // });
-                        break;
-                    case "LOGIN":
-                        if (typeof args[0] !== "string" || typeof args[1] !== "string") {
-                            writeResponse({
-                                tag: tag,
-                                type: "BAD"
-                            });
-                        } else if (handlers.auth) {
-                            switch (handlers.auth({
-                                connection: connection,
-                                username: args[0],
-                                password: args[1]
-                            }, {
-                                accept: (reason) => {
-                                    if (!a) writeResponse({
-                                        tag: tag,
-                                        type: "OK",
-                                        text: reason
-                                    });
-                                    a = true;
-                                },
-                                reject: (reason) => {
-                                    if (!a) writeResponse({
-                                        tag: tag,
-                                        type: "NO",
-                                        text: reason
-                                    });
-                                    a = true;
-                                }
-                            })) {
-                                case true:
-                                    if (!a) writeResponse({
-                                        tag: tag,
-                                        type: "OK"
-                                    });
-                                    break;
-                                case false:
-                                    if (!a) writeResponse({
-                                        tag: tag,
-                                        type: "NO"
-                                    });
-                                    break;
+                            writeResponse({ tag: tag, type: "OK", text: `${command} completed` });
+                            break;
+                        case "NOOP":
+                            if (args.length !== 0) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 0)` });
+                                break;
                             }
-                        } else {
-                            if (internal_state == "unauth") {
-                                writeResponse({
-                                    tag: tag,
-                                    type: "NO",
-                                    text: "unable to authenticate"
-                                });
-                            } else {
-                                writeResponse({
-                                    tag: tag,
-                                    type: "OK",
-                                    text: "already authenticated"
-                                });
-                            }
-                        }
-                        break;
-                    case "EXAMINE":
-                        let is_examine = true;
-                    case "SELECT":
-                        socket.write(`* 10 EXISTS\r\n`);
-                        socket.write(`* 1 RECENT\r\n`);
-                        socket.write(`* FLAGS (\\Seen \\Deleted \\Draft)\r\n`);
-                        socket.write(`* OK PERMANENTFLAGS (\\Seen \\Deleted)\r\n`);
-                        socket.write(`${tag} OK OK\r\n`);
-                        break;
-                    case "CREATE":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "DELETE":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "RENAME":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "SUBSCRIBE":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "UNSUBSCRIBE":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "LIST":
-                        socket.write(`* LIST (\\Marked) "/" INBOX/foo\r\n`);
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "LSUB":
-                        socket.write(`* LSUB (\\Marked) "/" INBOX/foo\r\n`);
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "STATUS":
-                        socket.write(`* STATUS ${args[0]} (MESSAGES 10 RECENT 1 UNSEEN 1)\r\n`);
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "APPEND":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "CHECK":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "CLOSE":
-                        internal_state = "auth";
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "EXPUNGE":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "SEARCH":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "FETCH":
-                        console.log("is_uid", _is_uid);
-                        const sequence_set = args.shift();
-                        // console.log(sequence_set);
 
-                        const details = args.shift();
-                        if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
+                            writeResponse({ tag: tag, type: "OK", text: `${command} completed` });
+                            break;
+                        case "LOGOUT":
+                            if (args.length !== 0) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 0)` });
+                                break;
+                            }
+
+                            if (handlers.close) handlers.close({ connection }, {});
+
+                            writeResponse({
+                                type: "BYE",
+                                text: "logout",
+                            });
                             writeResponse({
                                 tag: tag,
-                                type: "BAD"
+                                type: "OK",
+                            });
+                            socket.end();
+                            internal_state = "disconnected";
+                            break;
+                        case "STARTTLS": // tbd implement starttls (and tls itself lol)
+                            // 1. check if there's 0 arguments
+                            // 2. send "OK" (if available)
+                            // 3. immediately start handshake
+
+                            writeResponse({
+                                tag: tag,
+                                type: "BAD",
+                                text: "TLS unsupported",
                             });
                             break;
-                        }
+                        case "AUTHENTICATE":
+                            if (args.length !== 1) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 0)` });
+                                break;
+                            }
 
-                        const seq = sequence_set.toString().split(",").map(e => {
-                            if (e.includes(":")) {
-                                const g = e.split(":").map(e => e == "*" ? 10 : +e);
-                                return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
+                            if (args[0] === "PLAIN") {
+                                writeResponse({
+                                    type: "CONTINUE-REQ",
+                                }).then((_buffer) => {
+                                    const buffer = _buffer as Buffer;
+                                    const b64d = Buffer.from(buffer.toString(), "base64");
+                                    const f_z = b64d.indexOf("\0");
+                                    const s_z = b64d.indexOf("\0", f_z + 1);
+
+                                    if (handlers.auth) {
+                                        switch (handlers.auth({
+                                            connection: connection,
+                                            username: b64d.subarray(f_z + 1, s_z).toString(),
+                                            password: b64d.subarray(s_z + 1).toString()
+                                        }, {
+                                            accept: (reason) => {
+                                                if (!a) writeResponse({
+                                                    tag: tag,
+                                                    type: "OK",
+                                                    text: reason
+                                                });
+                                                a = true;
+                                            },
+                                            reject: (reason) => {
+                                                if (!a) writeResponse({
+                                                    tag: tag,
+                                                    type: "NO",
+                                                    text: reason
+                                                });
+                                                a = true;
+                                            }
+                                        })) {
+                                            case true:
+                                                if (!a) writeResponse({
+                                                    tag: tag,
+                                                    type: "OK"
+                                                });
+                                                break;
+                                            case false:
+                                                if (!a) writeResponse({
+                                                    tag: tag,
+                                                    type: "NO"
+                                                });
+                                                break;
+                                        }
+                                    } else {
+                                        if (internal_state == "unauth") {
+                                            writeResponse({
+                                                tag: tag,
+                                                type: "NO",
+                                                text: "unable to authenticate"
+                                            });
+                                        } else {
+                                            writeResponse({
+                                                tag: tag,
+                                                type: "OK",
+                                                text: "already authenticated"
+                                            });
+                                        }
+                                    }
+                                });
+                            } else writeResponse({
+                                tag: tag,
+                                type: "NO",
+                                text: "unsupported authentication mechanism",
+                            });
+                            break;
+                        case "LOGIN":
+                            if (typeof args[0] !== "string" || typeof args[1] !== "string") {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD"
+                                });
+                            } else if (handlers.auth) {
+                                switch (handlers.auth({
+                                    connection: connection,
+                                    username: args[0],
+                                    password: args[1]
+                                }, {
+                                    accept: (reason) => {
+                                        if (!a) writeResponse({
+                                            tag: tag,
+                                            type: "OK",
+                                            text: reason
+                                        });
+                                        a = true;
+                                    },
+                                    reject: (reason) => {
+                                        if (!a) writeResponse({
+                                            tag: tag,
+                                            type: "NO",
+                                            text: reason
+                                        });
+                                        a = true;
+                                    }
+                                })) {
+                                    case true:
+                                        if (!a) writeResponse({
+                                            tag: tag,
+                                            type: "OK"
+                                        });
+                                        break;
+                                    case false:
+                                        if (!a) writeResponse({
+                                            tag: tag,
+                                            type: "NO"
+                                        });
+                                        break;
+                                }
                             } else {
-                                return +e;
+                                if (internal_state == "unauth") {
+                                    writeResponse({
+                                        tag: tag,
+                                        type: "NO",
+                                        text: "unable to authenticate"
+                                    });
+                                } else {
+                                    writeResponse({
+                                        tag: tag,
+                                        type: "OK",
+                                        text: "already authenticated"
+                                    });
+                                }
                             }
-                        }).flat();
-                        console.log(seq);
-
-                        for (const se of seq) {
-                            if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
-                            else {
-                                        /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
-                                // break;
+                            break;
+                        case "EXAMINE":
+                            let is_examine = true;
+                        case "SELECT":
+                            if (args[0] !== null && typeof args[0] !== "string" && typeof args[0] !== "number") {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD",
+                                });
+                                break;
                             }
-                        }
+                            const mailbox_name: string = astring(args[0]); // nstring --> astring
 
 
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "STORE":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    case "COPY":
-                        writeResponse({
-                            tag: tag,
-                            type: "OK"
-                        });
-                        break;
-                    // case "UID":
-                    //     // let g = args.shift()?.toLowerCase();
-                    //     // console.log(args);
+                            socket.write(`* 10 EXISTS\r\n`);
+                            socket.write(`* 1 RECENT\r\n`);
+                            socket.write(`* FLAGS (\\Seen \\Deleted \\Draft)\r\n`);
+                            socket.write(`* OK PERMANENTFLAGS (\\Seen \\Deleted)\r\n`);
+                            socket.write(`${tag} OK OK\r\n`);
+                            break;
+                        case "CREATE":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "DELETE":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "RENAME":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "SUBSCRIBE":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "UNSUBSCRIBE":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "LIST":
+                            socket.write(`* LIST (\\Marked) "/" INBOX/foo\r\n`);
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "LSUB":
+                            socket.write(`* LSUB (\\Marked) "/" INBOX/foo\r\n`);
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "STATUS":
+                            socket.write(`* STATUS ${args[0]} (MESSAGES 10 RECENT 1 UNSEEN 1)\r\n`);
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "APPEND":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "CHECK":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "CLOSE":
+                            internal_state = "auth";
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "EXPUNGE":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "SEARCH":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "FETCH":
+                            console.log("is_uid", _is_uid);
+                            const sequence_set = args.shift();
+                            // console.log(sequence_set);
 
-                    //     const type = args.shift();
-                    //     // console.log(type);
-                    //     if (typeof type !== "string") {
-                    //         writeResponse({
-                    //             tag: tag,
-                    //             type: "BAD"
-                    //         });
-                    //         break;
-                    //     }
+                            const details = args.shift();
+                            if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD"
+                                });
+                                break;
+                            }
 
-                    //     switch (type.toLowerCase()) {
-                    //         case "copy":
-                    //             // copy implementation
-                    //             writeResponse({
-                    //                 tag: tag,
-                    //                 type: "OK"
-                    //             });
-                    //             break;
-                    //         case "fetch":
-                    //             const sequence_set = args.shift();
-                    //             // console.log(sequence_set);
+                            const seq = sequence_set.toString().split(",").map(e => {
+                                if (e.includes(":")) {
+                                    const g = e.split(":").map(e => e == "*" ? 10 : +e);
+                                    return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
+                                } else {
+                                    return +e;
+                                }
+                            }).flat();
+                            console.log(seq);
 
-                    //             const details = args.shift();
-                    //             if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
-                    //                 writeResponse({
-                    //                     tag: tag,
-                    //                     type: "BAD"
-                    //                 });
-                    //                 break;
-                    //             }
-
-                    //             const seq = sequence_set.toString().split(",").map(e => {
-                    //                 if (e.includes(":")) {
-                    //                     const g = e.split(":").map(e => e == "*" ? 10 : +e);
-                    //                     return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
-                    //                 } else {
-                    //                     return +e;
-                    //                 }
-                    //             }).flat();
-                    //             console.log(seq);
-
-                    //             for (const se of seq) {
-                    //                 if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
-                    //                 else {
-                    //                     /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
-                    //                     // break;
-                    //                 }
-                    //             }
+                            for (const se of seq) {
+                                if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
+                                else {
+                                            /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
+                                    // break;
+                                }
+                            }
 
 
-                    //             writeResponse({
-                    //                 tag: tag,
-                    //                 type: "OK"
-                    //             });
-                    //             break;
-                    //         case "store":
-                    //             writeResponse({
-                    //                 tag: tag,
-                    //                 type: "OK"
-                    //             });
-                    //             break;
-                    //         case "search":
-                    //             writeResponse({
-                    //                 tag: tag,
-                    //                 type: "OK"
-                    //             });
-                    //             break;
-                    //         default:
-                    //             writeResponse({
-                    //                 tag: tag,
-                    //                 type: "BAD"
-                    //             });
-                    //             break;
-                    //     }
-                    //     break;
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "STORE":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        case "COPY":
+                            writeResponse({
+                                tag: tag,
+                                type: "OK"
+                            });
+                            break;
+                        // case "UID":
+                        //     // let g = args.shift()?.toLowerCase();
+                        //     // console.log(args);
 
-                    // case ""
+                        //     const type = args.shift();
+                        //     // console.log(type);
+                        //     if (typeof type !== "string") {
+                        //         writeResponse({
+                        //             tag: tag,
+                        //             type: "BAD"
+                        //         });
+                        //         break;
+                        //     }
+
+                        //     switch (type.toLowerCase()) {
+                        //         case "copy":
+                        //             // copy implementation
+                        //             writeResponse({
+                        //                 tag: tag,
+                        //                 type: "OK"
+                        //             });
+                        //             break;
+                        //         case "fetch":
+                        //             const sequence_set = args.shift();
+                        //             // console.log(sequence_set);
+
+                        //             const details = args.shift();
+                        //             if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
+                        //                 writeResponse({
+                        //                     tag: tag,
+                        //                     type: "BAD"
+                        //                 });
+                        //                 break;
+                        //             }
+
+                        //             const seq = sequence_set.toString().split(",").map(e => {
+                        //                 if (e.includes(":")) {
+                        //                     const g = e.split(":").map(e => e == "*" ? 10 : +e);
+                        //                     return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
+                        //                 } else {
+                        //                     return +e;
+                        //                 }
+                        //             }).flat();
+                        //             console.log(seq);
+
+                        //             for (const se of seq) {
+                        //                 if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
+                        //                 else {
+                        //                     /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
+                        //                     // break;
+                        //                 }
+                        //             }
 
 
-                    // case "NOOP":
-                    //     socket.write(`${tag} OK OK\r\n`);
-                    //     break;
-                    // case "LOGOUT":
-                    //     socket.write(`* BYE BYE\r\n`);
-                    //     return socket.end();
-                    //     break;
-                    // case "SELECT":
-                    //     socket.write(`* 2 EXISTS\r\n`);
-                    //     socket.write(`* 1 RECENT\r\n`);
-                    //     socket.write(`* OK [UIDVALIDITY 100] UIDs valid\r\n`);
-                    //     socket.write(`* OK [UIDNEXT 5] Predicted next UID\r\n`);
-                    //     socket.write(`* FLAGS (\\Seen \\Deleted)\r\n`);
-                    //     socket.write(`${tag} OK OK\r\n`);
-                    //     conn.selected = "INBOX";
-                    //     break;
-                    default:
-                        socket.write(`${tag} BAD BAD\r\n`);
+                        //             writeResponse({
+                        //                 tag: tag,
+                        //                 type: "OK"
+                        //             });
+                        //             break;
+                        //         case "store":
+                        //             writeResponse({
+                        //                 tag: tag,
+                        //                 type: "OK"
+                        //             });
+                        //             break;
+                        //         case "search":
+                        //             writeResponse({
+                        //                 tag: tag,
+                        //                 type: "OK"
+                        //             });
+                        //             break;
+                        //         default:
+                        //             writeResponse({
+                        //                 tag: tag,
+                        //                 type: "BAD"
+                        //             });
+                        //             break;
+                        //     }
+                        //     break;
+
+                        // case ""
+
+
+                        // case "NOOP":
+                        //     socket.write(`${tag} OK OK\r\n`);
+                        //     break;
+                        // case "LOGOUT":
+                        //     socket.write(`* BYE BYE\r\n`);
+                        //     return socket.end();
+                        //     break;
+                        // case "SELECT":
+                        //     socket.write(`* 2 EXISTS\r\n`);
+                        //     socket.write(`* 1 RECENT\r\n`);
+                        //     socket.write(`* OK [UIDVALIDITY 100] UIDs valid\r\n`);
+                        //     socket.write(`* OK [UIDNEXT 5] Predicted next UID\r\n`);
+                        //     socket.write(`* FLAGS (\\Seen \\Deleted)\r\n`);
+                        //     socket.write(`${tag} OK OK\r\n`);
+                        //     conn.selected = "INBOX";
+                        //     break;
+                        default:
+                            socket.write(`${tag} BAD BAD\r\n`);
+                    }
+                } catch (_e) {
+                    console.error(_e);
+
+                    writeResponse({
+                        type: "BAD",
+                        text: `Internal server error`
+                    });
+                    writeResponse({
+                        type: "BYE",
+                        text: `Internal server error while handling ${command} (${tag})`
+                    });
+
+                    socket.end();
+                    internal_state = "disconnected";
+
+                    process.exit(1);
                 }
 
                 if (new_line !== -1) conn.buffer = conn.buffer.subarray(new_line + 2);

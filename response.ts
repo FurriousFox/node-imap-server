@@ -21,6 +21,9 @@ type IMAPResponse = {
 } | {
     type: "RAW";
     value: Buffer | string;
+} | {
+    type: "CAPABILITY";
+    capabilities: string[];
 };
 
 export default function (o: IMAPResponse) {
@@ -51,6 +54,9 @@ export default function (o: IMAPResponse) {
             break;
         case "RAW":
             socket.write(o.value);
+            break;
+        case "CAPABILITY":
+            socket.write(`* ${o.type} ${o.capabilities.join(" ")}\r\n`);
             break;
     }
 
