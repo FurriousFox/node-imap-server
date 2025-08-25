@@ -24,8 +24,21 @@ type IMAPConnection = {
     state: Object;
 };
 
+type IMAPBox = {
+    name: string;
+    subboxes?: IMAPBox[];
+
+    flags: ("\\Seen" | "\\Deleted" | "\\Draft" | "\\Answered" | "\\Recent" | "\\Flagged")[];
+    permanentflags: Exclude<IMAPBox["flags"][number], "\\Recent">[];
+
+    messages: {
+        count: number;
+        recent_count?: number;
+    };
+};
+
 export interface IMAPServerHandlers {
-    connection: (event: {
+    connection?: (event: {
         connection: IMAPConnection;
     }, action: {
         reject: (reason?: string) => void;
@@ -44,7 +57,13 @@ export interface IMAPServerHandlers {
     }, action: {
         accept: (reason?: string) => void;
         reject: (reason?: string) => void;
-    }) => any;
+    }) => void | boolean | Promise<boolean | void>;
+
+    boxes: (event: {
+        connection: IMAPConnection;
+    }, action: {
+        resolve: (inboxes: IMAPBox[]) => void;
+    }) => void | IMAPBox[] | Promise<IMAPBox[] | void>;
 
     unknown?: (event: {
         connection: IMAPConnection;
@@ -54,8 +73,12 @@ export interface IMAPServerHandlers {
     }) => any;
 }
 
-function astring(nstring: null | number | string) {
+type nstring = (null | number | string);
+function astring(nstring: nstring) {
     return nstring?.toString() ?? "NIL";
+}
+function isnstring(nstring: any): nstring is nstring {
+    return (nstring == null || typeof nstring == "number" || typeof nstring == "string");
 }
 
 export class IMAPServer {
@@ -69,7 +92,7 @@ export class IMAPServer {
         net.createServer({
             keepAlive: true,
         }, (socket: IMAPSocket) => {
-            let internal_state: "unauth" | "auth" | "selected" | "disconnected" = "unauth";
+            let internal_state: "unauth" | "auth" | "selected" | "disconnected" | "examined" = "unauth";
             const owrite = socket.write.bind(socket);
             socket.write = (chunk: string | Uint8Array, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void): boolean => {
                 process.stdout.write("S: ");
@@ -100,42 +123,88 @@ export class IMAPServer {
                 selected: null,
             };
 
+            function internalError(error: {
+                error: Error;
+            } | {
+                error: Error;
+                tag: string;
+                command: string;
+            }) {
+                console.error(error.error);
+
+                writeResponse({
+                    tag: 'tag' in error ? error.tag : undefined,
+                    type: "BAD",
+                    text: `Internal server error`
+                });
+                writeResponse({
+                    type: "BYE",
+                    text: `Internal server error${'command' in error ? ` while handling ${error.command} (${error.tag})` : ""}`
+                });
+
+                socket.end();
+                internal_state = "disconnected";
+            }
+
             {
                 let a = false;
-                this.handlers.connection({ connection: connection }, {
-                    reject(reason) {
+                if (handlers.connection) {
+                    try {
+                        handlers.connection({ connection: connection }, {
+                            reject(reason) {
+                                if (!a) {
+                                    writeResponse({
+                                        type: "BYE",
+                                        text: reason,
+                                    });
+                                    socket.end();
+                                    internal_state = "disconnected";
+                                }
+
+                                a = true;
+                            },
+                            requireLogin() {
+                                if (!a) {
+                                    writeResponse({
+                                        type: "OK",
+                                        text: "IMAP4rev1 Service Ready"
+                                    });
+                                    internal_state = "unauth";
+                                }
+                                a = true;
+                            },
+                            noAuth() {
+                                if (!a) {
+                                    writeResponse({
+                                        type: "PREAUTH",
+                                        text: "IMAP4rev1 logged in"
+                                    });
+                                    internal_state = "auth";
+                                }
+                                a = true;
+                            }
+                        });
+                    } catch (_e) {
                         if (!a) {
                             writeResponse({
                                 type: "BYE",
-                                text: reason,
+                                text: "Internal server error while handling new connection",
                             });
                             socket.end();
                             internal_state = "disconnected";
+                            return;
                         }
-
-                        a = true;
-                    },
-                    requireLogin() {
-                        if (!a) {
-                            writeResponse({
-                                type: "OK",
-                                text: "IMAP4rev1 Service Ready"
-                            });
-                            internal_state = "unauth";
-                        }
-                        a = true;
-                    },
-                    noAuth() {
-                        if (!a) {
-                            writeResponse({
-                                type: "PREAUTH",
-                                text: "IMAP4rev1 logged in"
-                            });
-                            internal_state = "auth";
-                        }
-                        a = true;
                     }
-                });
+                } else {
+                    if (!a) {
+                        writeResponse({
+                            type: "OK",
+                            text: "IMAP4rev1 Service Ready"
+                        });
+                        internal_state = "unauth";
+                    }
+                    a = true;
+                }
             }
 
             function tryParse() {
@@ -284,7 +353,7 @@ export class IMAPServer {
                 let a = false;
 
                 try {
-                    let _is_uid = false;
+                    let _is_uid, _is_examine = false;
                     if (command == "UID" && typeof args[0] == "string") if (args[0].toUpperCase() === "COPY" || args[0].toUpperCase() === "FETCH" || args[0].toUpperCase() === "STORE" || args[0].toUpperCase() === "SEARCH") _is_uid = true, command = (args.shift() as string).toUpperCase();
                     switch (command) {
                         case "CAPABILITY":
@@ -298,7 +367,7 @@ export class IMAPServer {
                                 type: "CAPABILITY",
                                 capabilities: [
                                     "IMAP4rev1",
-                                    // "AUTH=PLAIN"
+                                    "AUTH=PLAIN"
                                 ]
                             });
 
@@ -318,7 +387,13 @@ export class IMAPServer {
                                 break;
                             }
 
-                            if (handlers.close) handlers.close({ connection }, {});
+                            if (handlers.close) {
+                                try {
+                                    handlers.close({ connection }, {});
+                                } catch (_e) {
+                                    console.error(_e);
+                                }
+                            }
 
                             writeResponse({
                                 type: "BYE",
@@ -332,8 +407,9 @@ export class IMAPServer {
                             internal_state = "disconnected";
                             break;
                         case "STARTTLS": // tbd implement starttls (and tls itself lol)
-                            // 1. check if there's 0 arguments
-                            // 2. send "OK" (if available)
+                            // 1. check if there's 0 arguments (else BAD)
+                            // 2. check if state == unauth (else BAD)
+                            // 2. send "OK" (if available, else BAD)
                             // 3. immediately start handshake
 
                             writeResponse({
@@ -343,8 +419,12 @@ export class IMAPServer {
                             });
                             break;
                         case "AUTHENTICATE":
+                            if (internal_state !== "unauth") {
+                                writeResponse({ tag: tag, type: "BAD", text: `command only available in unauthenticated state` });
+                                break;
+                            }
                             if (args.length !== 1) {
-                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 0)` });
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 1)` });
                                 break;
                             }
 
@@ -352,61 +432,127 @@ export class IMAPServer {
                                 writeResponse({
                                     type: "CONTINUE-REQ",
                                 }).then((_buffer) => {
-                                    const buffer = _buffer as Buffer;
-                                    const b64d = Buffer.from(buffer.toString(), "base64");
-                                    const f_z = b64d.indexOf("\0");
-                                    const s_z = b64d.indexOf("\0", f_z + 1);
-
-                                    if (handlers.auth) {
-                                        switch (handlers.auth({
-                                            connection: connection,
-                                            username: b64d.subarray(f_z + 1, s_z).toString(),
-                                            password: b64d.subarray(s_z + 1).toString()
-                                        }, {
-                                            accept: (reason) => {
-                                                if (!a) writeResponse({
-                                                    tag: tag,
-                                                    type: "OK",
-                                                    text: reason
-                                                });
-                                                a = true;
-                                            },
-                                            reject: (reason) => {
-                                                if (!a) writeResponse({
-                                                    tag: tag,
-                                                    type: "NO",
-                                                    text: reason
-                                                });
-                                                a = true;
-                                            }
-                                        })) {
-                                            case true:
-                                                if (!a) writeResponse({
-                                                    tag: tag,
-                                                    type: "OK"
-                                                });
-                                                break;
-                                            case false:
-                                                if (!a) writeResponse({
-                                                    tag: tag,
-                                                    type: "NO"
-                                                });
-                                                break;
-                                        }
-                                    } else {
-                                        if (internal_state == "unauth") {
-                                            writeResponse({
+                                    try {
+                                        const buffer = _buffer as Buffer;
+                                        if (buffer.toString().trim() == "*") {
+                                            return writeResponse({
                                                 tag: tag,
-                                                type: "NO",
-                                                text: "unable to authenticate"
+                                                type: "BAD",
+                                                text: "authentication cancelled"
                                             });
+                                        }
+
+                                        const b64d = Buffer.from(buffer.toString(), "base64");
+                                        const f_z = b64d.indexOf("\0");
+                                        const s_z = b64d.indexOf("\0", f_z + 1);
+
+                                        if (handlers.auth) {
+                                            try {
+                                                let c: Promise<boolean | void> | boolean | void;
+                                                switch (c = handlers.auth({
+                                                    connection: connection,
+                                                    username: b64d.subarray(f_z + 1, s_z).toString(),
+                                                    password: b64d.subarray(s_z + 1).toString()
+                                                }, {
+                                                    accept: (reason) => {
+                                                        if (!a) {
+                                                            writeResponse({
+                                                                tag: tag,
+                                                                type: "OK",
+                                                                text: reason
+                                                            });
+                                                            a = true;
+
+                                                            internal_state = "auth";
+                                                        }
+                                                    },
+                                                    reject: (reason) => {
+                                                        if (!a) {
+                                                            writeResponse({
+                                                                tag: tag,
+                                                                type: "NO",
+                                                                text: reason
+                                                            });
+                                                            a = true;
+
+                                                            internal_state = "unauth";
+                                                        }
+                                                    }
+                                                })) {
+                                                    case true:
+                                                        if (!a) {
+                                                            writeResponse({
+                                                                tag: tag,
+                                                                type: "OK"
+                                                            });
+                                                            a = true;
+
+                                                            internal_state = "auth";
+                                                            break;
+                                                        }
+                                                    case false:
+                                                        if (!a) {
+                                                            writeResponse({
+                                                                tag: tag,
+                                                                type: "NO"
+                                                            });
+                                                            a = true;
+
+                                                            internal_state = "unauth";
+                                                            break;
+                                                        }
+                                                }
+
+                                                if (c instanceof Promise) {
+                                                    c.then((value) => {
+                                                        if (a) return;
+
+                                                        if (value == true) {
+                                                            writeResponse({
+                                                                tag: tag,
+                                                                type: "OK"
+                                                            });
+                                                            a = true;
+
+                                                            internal_state = "auth";
+                                                            return;
+                                                        } else if (value == false) {
+                                                            writeResponse({
+                                                                tag: tag,
+                                                                type: "NO"
+                                                            });
+                                                            a = true;
+
+                                                            internal_state = "unauth";
+                                                        }
+                                                    }).catch((_e) => {
+                                                        internalError({
+                                                            error: _e,
+                                                            tag: tag,
+                                                            command: command
+                                                        });
+                                                    });
+                                                }
+                                            } catch (_e) {
+                                                internalError({
+                                                    error: _e,
+                                                    tag: tag,
+                                                    command: command
+                                                });
+                                            }
                                         } else {
                                             writeResponse({
                                                 tag: tag,
-                                                type: "OK",
-                                                text: "already authenticated"
+                                                type: "BAD",
+                                                text: "authentication unavailable"
                                             });
                                         }
+                                    } catch (_e) {
+                                        writeResponse({
+                                            tag: tag,
+                                            type: "BAD",
+                                            text: "unable to handle (likely invalid) client input"
+                                        });
                                     }
                                 });
                             } else writeResponse({
@@ -416,81 +562,180 @@ export class IMAPServer {
                             });
                             break;
                         case "LOGIN":
-                            if (typeof args[0] !== "string" || typeof args[1] !== "string") {
-                                writeResponse({
-                                    tag: tag,
-                                    type: "BAD"
-                                });
-                            } else if (handlers.auth) {
-                                switch (handlers.auth({
-                                    connection: connection,
-                                    username: args[0],
-                                    password: args[1]
-                                }, {
-                                    accept: (reason) => {
-                                        if (!a) writeResponse({
-                                            tag: tag,
-                                            type: "OK",
-                                            text: reason
-                                        });
-                                        a = true;
-                                    },
-                                    reject: (reason) => {
-                                        if (!a) writeResponse({
-                                            tag: tag,
-                                            type: "NO",
-                                            text: reason
-                                        });
-                                        a = true;
-                                    }
-                                })) {
-                                    case true:
-                                        if (!a) writeResponse({
-                                            tag: tag,
-                                            type: "OK"
-                                        });
-                                        break;
-                                    case false:
-                                        if (!a) writeResponse({
-                                            tag: tag,
-                                            type: "NO"
-                                        });
-                                        break;
-                                }
-                            } else {
-                                if (internal_state == "unauth") {
-                                    writeResponse({
-                                        tag: tag,
-                                        type: "NO",
-                                        text: "unable to authenticate"
-                                    });
-                                } else {
-                                    writeResponse({
-                                        tag: tag,
-                                        type: "OK",
-                                        text: "already authenticated"
-                                    });
-                                }
+                            if (internal_state !== "unauth") {
+                                writeResponse({ tag: tag, type: "BAD", text: `command only available in unauthenticated state` });
+                                break;
                             }
-                            break;
-                        case "EXAMINE":
-                            let is_examine = true;
-                        case "SELECT":
-                            if (args[0] !== null && typeof args[0] !== "string" && typeof args[0] !== "number") {
+                            if (args.length !== 2) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 2)` });
+                                break;
+                            }
+
+                            if (!isnstring(args[0]) || !isnstring(args[1])) {
                                 writeResponse({
                                     tag: tag,
                                     type: "BAD",
+                                    text: "invalid arguments"
+                                });
+                            } else if (handlers.auth) {
+                                try {
+                                    let c: Promise<boolean | void> | boolean | void;
+
+                                    switch (c = handlers.auth({
+                                        connection: connection,
+                                        username: astring(args[0]),
+                                        password: astring(args[1])
+                                    }, {
+                                        accept: (reason) => {
+                                            if (!a) {
+                                                writeResponse({
+                                                    tag: tag,
+                                                    type: "OK",
+                                                    text: reason
+                                                });
+                                                a = true;
+
+                                                internal_state = "auth";
+                                            }
+                                        },
+                                        reject: (reason) => {
+                                            if (!a) {
+                                                writeResponse({
+                                                    tag: tag,
+                                                    type: "NO",
+                                                    text: reason
+                                                });
+                                                a = true;
+
+                                                internal_state = "unauth";
+                                            }
+                                        }
+                                    })) {
+                                        case true:
+                                            if (!a) {
+                                                writeResponse({
+                                                    tag: tag,
+                                                    type: "OK"
+                                                });
+
+                                                internal_state = "auth";
+                                                break;
+                                            }
+                                        case false:
+                                            if (!a) {
+                                                writeResponse({
+                                                    tag: tag,
+                                                    type: "NO"
+                                                });
+
+                                                internal_state = "unauth";
+                                                break;
+                                            }
+                                    }
+
+                                    if (c instanceof Promise) {
+                                        c.then((value) => {
+                                            if (a) return;
+
+                                            if (value == true) {
+                                                writeResponse({
+                                                    tag: tag,
+                                                    type: "OK"
+                                                });
+                                                a = true;
+
+                                                internal_state = "auth";
+                                                return;
+                                            } else if (value == false) {
+                                                writeResponse({
+                                                    tag: tag,
+                                                    type: "NO"
+                                                });
+                                                a = true;
+
+                                                internal_state = "unauth";
+                                            }
+                                        }).catch((_e) => {
+                                            internalError({
+                                                error: _e,
+                                                tag: tag,
+                                                command: command
+                                            });
+                                        });
+                                    }
+                                } catch (_e) {
+                                    internalError({
+                                        error: _e,
+                                        tag: tag,
+                                        command: command
+                                    });
+                                }
+                            } else {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD",
+                                    text: "authentication unavailable"
+                                });
+                            }
+                            break;
+                        case "EXAMINE":
+                            _is_examine = true;
+                        case "SELECT":
+                            if (internal_state == "unauth") {
+                                writeResponse({ tag: tag, type: "BAD", text: `authentication required` });
+                                break;
+                            }
+                            if (args.length !== 1) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 1)` });
+                                break;
+                            }
+                            if (!isnstring(args[0])) {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD",
+                                    text: "invalid mailbox name"
                                 });
                                 break;
                             }
-                            const mailbox_name: string = astring(args[0]); // nstring --> astring
+                            const mailbox_name: string = astring(args[0]);
+                            /*
+                             If the client is permitted to modify the mailbox, the server
+                             SHOULD prefix the text of the tagged OK response with the
+                             "[READ-WRITE]" response code.
+                            */
 
+                            // get information about mailbox
+                            /*
+                            untagged: 
+                             FLAGS flag parenthesized list; FLAGS (\Answered \Flagged \Deleted \Seen \Draft \Recent)
+                                the flags defined in the mailbox
+
+                             <n> EXISTS; 100 EXISTS
+                                the number of messages in the mailbox
+
+                             <n> RECENT; 25 RECENT
+                                the number of messages with the \Recent flag set
+
+                             OK [UNSEEN <n>] message; OK [UNSEEN 13] UNSEEN
+                                *sequence number* of the first unread message
+                               
+                             OK [PERMANENTFLAGS (flags)] message; OK [PERMANENTFLAGS (\Deleted \Seen (\Draft maybe??))] PERMANENTFLAGS
+                                flags that can be modified permanently
+
+                             OK [UIDNEXT <n>] message; OK [UIDNEXT 4392] UIDNEXT
+                                predicted next UID
+
+                             OK [UIDVALIDITY <n>] message; OK [UIDVALIDITY 1234] UIDVALIDITY
+                                the unique identifier validity value
+                                
+                            The combination of mailbox name, UIDVALIDITY, and UID must refer to a single immutable message on that server forever
+                            */
 
                             socket.write(`* 10 EXISTS\r\n`);
                             socket.write(`* 1 RECENT\r\n`);
                             socket.write(`* FLAGS (\\Seen \\Deleted \\Draft)\r\n`);
-                            socket.write(`* OK PERMANENTFLAGS (\\Seen \\Deleted)\r\n`);
-                            socket.write(`${tag} OK OK\r\n`);
+                            socket.write(`* OK PERMANENTFLAGS ${_is_examine ? "()" : "(\\Seen \\Deleted)"}\r\n`);
+                            socket.write(`${tag}${_is_examine ? " [READ-ONLY] " : " "}OK OK\r\n`);
                             break;
                         case "CREATE":
                             writeResponse({
@@ -730,23 +975,60 @@ export class IMAPServer {
                     console.error(_e);
 
                     writeResponse({
+                        tag: tag,
                         type: "BAD",
-                        text: `Internal server error`
-                    });
-                    writeResponse({
-                        type: "BYE",
-                        text: `Internal server error while handling ${command} (${tag})`
+                        text: "unable to handle (likely invalid) client input"
                     });
 
-                    socket.end();
-                    internal_state = "disconnected";
+                    // writeResponse({
+                    //     type: "BAD",
+                    //     text: `Internal server error`
+                    // });
+                    // writeResponse({
+                    //     type: "BYE",
+                    //     text: `Internal server error while handling ${command} (${tag})`
+                    // });
 
-                    process.exit(1);
+                    // socket.end();
+                    // internal_state = "disconnected";
+
+                    // process.exit(1);
                 }
 
                 if (new_line !== -1) conn.buffer = conn.buffer.subarray(new_line + 2);
-                if (internal_state !== "disconnected") tryParse();
+                // if (internal_state !== "disconnected") tryParse();
             }
+
+            // const resolveness: {
+            //     resolve: () => void,
+            //     resolveable: boolean,
+            //     timeout: NodeJS.Timeout,
+            // } = {
+            //     resolve: () => { },
+            //     resolveable: false,
+            //     timeout: setTimeout(() => { })
+            // };
+
+            // (async () => {
+            //     while (true) {
+            //         await tryParse().catch(() => { });
+
+            //         if (conn.buffer.indexOf("\r\n") == -1) {
+            //             resolveness.resolveable = true;
+            //             const promise = new Promise(r => {
+            //                 resolveness.resolve = r as typeof resolveness.resolve;
+            //                 resolveness.timeout = setTimeout(() => {
+            //                     if (resolveness.resolveable) {
+            //                         resolveness.resolveable = false;
+            //                         resolveness.resolve();
+            //                     }
+            //                 }, 100);
+            //             });
+
+            //             await promise;
+            //         }
+            //     }
+            // })();
 
             socket.on("data", (data) => {
                 process.stdout.write("C: ");
