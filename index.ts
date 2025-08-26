@@ -22,17 +22,20 @@ enum IMAPState {
     examined = "examined"
 }
 
+let connection_counter = 0;
 type IMAPConnection = {
     source: {
         port: number;
         family: 'IPv4' | 'IPv6';
         address: string;
     };
+    id: number;
     state: Object;
 };
 
 type IMAPBox = {
     name: string;
+    id?: any;
     subboxes?: IMAPBox[];
 
     flags: ("\\Seen" | "\\Deleted" | "\\Draft" | "\\Answered" | "\\Recent" | "\\Flagged")[];
@@ -40,6 +43,7 @@ type IMAPBox = {
 
     messages: {
         count: number;
+        unread_count: number;
         recent_count?: number;
     };
 };
@@ -69,7 +73,7 @@ export interface IMAPServerHandlers {
     boxes: (event: {
         connection: IMAPConnection;
     }, action: {
-        resolve: (inboxes: IMAPBox[]) => void;
+        resolve: (boxes: IMAPBox[]) => void;
     }) => void | IMAPBox[] | Promise<IMAPBox[] | void>;
 
     unknown?: (event: {
@@ -124,12 +128,47 @@ export class IMAPServer {
                     family: socket.remoteFamily! as "IPv4" | "IPv6",
                     address: socket.remoteAddress!,
                 },
+                id: ++connection_counter,
                 state: new Object(),
             };
             let conn: { buffer: Buffer, selected: null | string; } = {
                 buffer: Buffer.alloc(0),
                 selected: null,
             };
+
+            async function getBoxes(): Promise<IMAPBox[]> {
+                function flatten(boxes: IMAPBox[], prefix: string = ""): IMAPBox[] {
+                    const flat: IMAPBox[] = [];
+
+                    for (const box of boxes) {
+                        const shallow_box = Object.assign({}, box);
+                        shallow_box.name = `${prefix}${box.name}`;
+                        flat.push(shallow_box);
+
+                        if (box.subboxes) flat.push(...flatten(box.subboxes, `${prefix}${box.name}/`));
+                    }
+
+                    return flat;
+                }
+
+                return flatten(await new Promise<IMAPBox[]>((resolve) => {
+                    try {
+                        const result = handlers.boxes({ connection }, {
+                            resolve: (boxes: IMAPBox[]) => {
+                                resolve(boxes);
+                            }
+                        });
+                        if (result instanceof Promise) {
+                            result.then((value) => resolve(value ?? [])).catch((_e) => { console.error(_e); resolve([]); });
+                        } else if (result !== undefined) {
+                            resolve(result);
+                        }
+                    } catch (_e) {
+                        console.error(_e); resolve([]);
+                    }
+                }));
+            }
+
 
             function internalError(error: {
                 error: Error;
@@ -406,6 +445,7 @@ export class IMAPServer {
                             writeResponse({
                                 tag: tag,
                                 type: "OK",
+                                text: "LOGOUT"
                             });
                             socket.end();
                             internal_state = IMAPState.disconnected;
@@ -706,12 +746,25 @@ export class IMAPServer {
                                 });
                                 break;
                             }
-                            const mailbox_name: string = astring(args[0]);
+                            const mailbox_name: string = astring(args[0]).toUpperCase() == "INBOX" ? "INBOX" : astring(args[0]);
                             /*
                              If the client is permitted to modify the mailbox, the server
                              SHOULD prefix the text of the tagged OK response with the
-                             "[READ-WRITE]" response code.
+                             "" response code.
                             */
+
+                            const boxes = await getBoxes();
+                            if (!(boxes.filter(box => box.name == mailbox_name).length)) {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "NO",
+                                    text: "mailbox unavailable"
+                                });
+                                conn.selected = null;
+                                internal_state = IMAPState.auth;
+                                break;
+                            }
+                            const box: IMAPBox = boxes.filter(box => box.name == mailbox_name)[0];
 
                             // get information about mailbox
                             /*
@@ -740,11 +793,27 @@ export class IMAPServer {
                             The combination of mailbox name, UIDVALIDITY, and UID must refer to a single immutable message on that server forever
                             */
 
-                            socket.write(`* 10 EXISTS\r\n`);
-                            socket.write(`* 1 RECENT\r\n`);
-                            socket.write(`* FLAGS (\\Seen \\Deleted \\Draft)\r\n`);
-                            socket.write(`* OK PERMANENTFLAGS ${_is_examine ? "()" : "(\\Seen \\Deleted)"}\r\n`);
-                            socket.write(`${tag}${_is_examine ? " [READ-ONLY] " : " "}OK OK\r\n`);
+                            // socket.write(`* 10 EXISTS\r\n`);
+                            socket.write(`* ${box.messages.count} EXISTS\r\n`);
+
+                            // socket.write(`* 1 RECENT\r\n`);
+                            socket.write(`* ${box.messages.recent_count ?? box.messages.count} RECENT\r\n`);
+
+                            // UNSEEN
+                            socket.write(`* OK [UNSEEN ${box.messages.unread_count}] UNSEEN\r\n`);
+
+                            // socket.write(`* FLAGS (\\Seen \\Deleted \\Draft)\r\n`);
+                            socket.write(`* FLAGS (${box.flags.join(" ")})\r\n`);
+
+                            // socket.write(`* OK PERMANENTFLAGS ${_is_examine ? "()" : "(\\Seen \\Deleted)"}\r\n`);
+                            socket.write(`* OK [PERMANENTFLAGS ${_is_examine ? "()" : `(${box.permanentflags.join(" ")})`}] PERMANENTFLAGS\r\n`);
+
+                            // UIDNEXT
+                            // UIDVALIDITY
+
+                            conn.selected = mailbox_name;
+                            internal_state = _is_examine ? IMAPState.examined : IMAPState.selected;
+                            socket.write(`${tag} ${_is_examine ? "[READ-ONLY]" : "[READ-WRITE]"} OK SELECT\r\n`);
                             break;
                         case "CREATE":
                             writeResponse({
@@ -776,20 +845,42 @@ export class IMAPServer {
                                 type: "OK"
                             });
                             break;
-                        case "LIST":
-                            socket.write(`* LIST (\\Marked) "/" INBOX/foo\r\n`);
+                        case "LIST": {
+                            // internal_state
+                            // args[]
+
+                            const boxes = await getBoxes();
+
+                            // tbd: \Noinferiors(?)
+                            // NOTE: There can be multiple LIST responses for a single LIST command.
+
+                            for (const box of boxes) {
+                                socket.write(`* LIST () "/" ${box.name}\r\n`);
+                            }
+
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
-                        case "LSUB":
-                            socket.write(`* LSUB (\\Marked) "/" INBOX/foo\r\n`);
+                        }
+                        case "LSUB": {
+                            const boxes = await getBoxes();
+
+                            // tbd: \Noinferiors(?)
+                            // NOTE: There can be multiple LIST responses for a single LIST command.
+
+                            for (const box of boxes) {
+                                socket.write(`* LSUB () "/" ${box.name}\r\n`);
+                            }
+                            // socket.write(`* LSUB (\\Marked) "/" INBOX/foo\r\n`);
+
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
+                        }
                         case "STATUS":
                             socket.write(`* STATUS ${args[0]} (MESSAGES 10 RECENT 1 UNSEEN 1)\r\n`);
                             writeResponse({
@@ -1069,9 +1160,15 @@ export class IMAPServer {
 
             socket.on("close", () => {
                 internal_state = IMAPState.disconnected;
-                if (handlers.close) handlers.close({ connection }, {});
+                if (handlers.close) {
+                    try {
+                        handlers.close({ connection }, {});
+                    } catch (_e) {
+                        console.error(_e);
+                    }
+                }
             });
-            socket.on("error", console.error);
+            socket.on("error", /* console.error */() => { });
         }).listen(options.port, options.address ?? "::1", () => {
             console.log(`listening on port ${options.address ?? "::1"}:${options.port}`);
         });

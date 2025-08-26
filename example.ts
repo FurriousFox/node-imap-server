@@ -23,12 +23,27 @@ new IMAPServer({
     boxes(event, action) {
         action.resolve([{
             name: "INBOX",
+            id: "INBOX",
 
-            flags: [],
-            permanentflags: [],
+            subboxes: [{
+                name: "subbox",
+                id: "INBOX-subbox",
+
+                flags: ["\\Seen", "\\Deleted", "\\Draft"],
+                permanentflags: ["\\Seen", "\\Deleted"],
+
+                messages: {
+                    count: 1,
+                    unread_count: 1,
+                }
+            }],
+
+            flags: ["\\Seen", "\\Deleted", "\\Draft"],
+            permanentflags: ["\\Seen", "\\Deleted"],
 
             messages: {
                 count: 1,
+                unread_count: 1,
             }
         }]);
     }
