@@ -1,4 +1,4 @@
-import IMAPServer from "./index.ts";
+import IMAPServer, { IMAPBox, IMAPMessageDetails } from "./index.ts";
 import crypto from "node:crypto";
 
 new IMAPServer({
@@ -46,5 +46,13 @@ new IMAPServer({
                 unread_count: 1,
             }
         }]);
+    },
+
+    getMessageDetails({ box: IMAPBox, range }) {
+        // must be fast MAY NOT take long
+    },
+
+    getMessage(box: IMAPBox, uid: IMAPMessageDetails["uid"]) {
+        // MAY take long
     }
 });

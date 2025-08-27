@@ -33,10 +33,11 @@ type IMAPConnection = {
     state: Object;
 };
 
-type IMAPBox = {
+export type IMAPBox = {
     name: string;
     id?: any;
     subboxes?: IMAPBox[];
+    parent?: IMAPBox;
 
     flags: ("\\Seen" | "\\Deleted" | "\\Draft" | "\\Answered" | "\\Recent" | "\\Flagged")[];
     permanentflags: Exclude<IMAPBox["flags"][number], "\\Recent">[];
@@ -47,6 +48,94 @@ type IMAPBox = {
         recent_count?: number;
     };
 };
+
+export type IMAPMessageDetails = {
+    uid: string | number;
+
+    flags: ("\\Seen" | "\\Deleted" | "\\Draft" | "\\Answered" | "\\Recent" | "\\Flagged")[];
+
+    internet_message_id: string;
+    replied_internet_message_id?: string;
+    // replied_conversation_id?: string;
+
+    date: Date;
+    received_date?: Date;
+
+    sender?: {
+        name?: string;
+        address: string;
+    };
+
+    from: {
+        name?: string;
+        address: string;
+    };
+
+    replyTo?: {
+        name?: string;
+        address: string;
+    }[];
+
+    to: {
+        name?: string;
+        address: string;
+    }[];
+
+    cc?: IMAPMessageDetails["to"];
+    bcc?: IMAPMessageDetails["to"];
+
+    subject: string;
+
+    body?: {
+        contentType?: string;
+        content?: string | Buffer;
+    };
+
+    mimeContent?: string | Buffer;
+};
+
+export type IMAPMessage = {
+    uid: string | number;
+
+    flags: ("\\Seen" | "\\Deleted" | "\\Draft" | "\\Answered" | "\\Recent" | "\\Flagged")[];
+
+    internet_message_id: string;
+    replied_internet_message_id?: string;
+    // replied_conversation_id?: string;
+
+    date: Date;
+    received_date?: Date;
+
+    from: {
+        name?: string;
+        address: string;
+    };
+
+    replyTo?: {
+        name?: string;
+        address: string;
+    }[];
+
+    to: {
+        name?: string;
+        address: string;
+    }[];
+
+    cc?: IMAPMessageDetails["to"];
+    bcc?: IMAPMessageDetails["to"];
+
+    subject: string;
+
+    body: {
+        contentType?: string;
+        content?: string | Buffer;
+    };
+
+    mimeContent: string | Buffer;
+};
+
+
+
 
 export interface IMAPServerHandlers {
     connection?: (event: {
@@ -75,6 +164,22 @@ export interface IMAPServerHandlers {
     }, action: {
         resolve: (boxes: IMAPBox[]) => void;
     }) => void | IMAPBox[] | Promise<IMAPBox[] | void>;
+
+    getMessageDetails: (event: {
+        connection: IMAPConnection;
+        box?: IMAPBox;
+        range?: number[];
+    }, action: {
+        resolve: (messageDetails: IMAPMessageDetails[]) => void;
+    }) => void | IMAPMessageDetails[] | Promise<void | IMAPMessageDetails[]>;
+
+    getMessage: (event: {
+        connection: IMAPConnection;
+        box?: IMAPBox;
+        uid: IMAPMessageDetails["uid"];
+    }, action: {
+        resolve: (messageDetails: IMAPMessage) => void;
+    }) => void | IMAPMessage[] | Promise<void | IMAPMessage[] | string> | string;
 
     unknown?: (event: {
         connection: IMAPConnection;
@@ -143,9 +248,14 @@ export class IMAPServer {
                     for (const box of boxes) {
                         const shallow_box = Object.assign({}, box);
                         shallow_box.name = `${prefix}${box.name}`;
+                        if (shallow_box.parent) delete shallow_box.parent;
                         flat.push(shallow_box);
 
-                        if (box.subboxes) flat.push(...flatten(box.subboxes, `${prefix}${box.name}/`));
+                        if (box.subboxes) {
+                            const sub_shallow_boxes = flatten(box.subboxes, `${prefix}${box.name}/`);
+                            for (const sub_shallow_box of sub_shallow_boxes) sub_shallow_box.parent = shallow_box;
+                            flat.push(...sub_shallow_boxes);
+                        }
                     }
 
                     return flat;
@@ -729,7 +839,7 @@ export class IMAPServer {
                             break;
                         case "EXAMINE":
                             _is_examine = true;
-                        case "SELECT":
+                        case "SELECT": {
                             if (internal_state == IMAPState.unauth) {
                                 writeResponse({ tag: tag, type: "BAD", text: `authentication required` });
                                 break;
@@ -750,7 +860,7 @@ export class IMAPServer {
                             /*
                              If the client is permitted to modify the mailbox, the server
                              SHOULD prefix the text of the tagged OK response with the
-                             "" response code.
+                             "READ-WRITE" response code.
                             */
 
                             const boxes = await getBoxes();
@@ -771,22 +881,22 @@ export class IMAPServer {
                             untagged: 
                              FLAGS flag parenthesized list; FLAGS (\Answered \Flagged \Deleted \Seen \Draft \Recent)
                                 the flags defined in the mailbox
-
+ 
                              <n> EXISTS; 100 EXISTS
                                 the number of messages in the mailbox
-
+ 
                              <n> RECENT; 25 RECENT
                                 the number of messages with the \Recent flag set
-
+ 
                              OK [UNSEEN <n>] message; OK [UNSEEN 13] UNSEEN
                                 *sequence number* of the first unread message
                                
                              OK [PERMANENTFLAGS (flags)] message; OK [PERMANENTFLAGS (\Deleted \Seen (\Draft maybe??))] PERMANENTFLAGS
                                 flags that can be modified permanently
-
+ 
                              OK [UIDNEXT <n>] message; OK [UIDNEXT 4392] UIDNEXT
                                 predicted next UID
-
+ 
                              OK [UIDVALIDITY <n>] message; OK [UIDVALIDITY 1234] UIDVALIDITY
                                 the unique identifier validity value
                                 
@@ -815,6 +925,7 @@ export class IMAPServer {
                             internal_state = _is_examine ? IMAPState.examined : IMAPState.selected;
                             socket.write(`${tag} ${_is_examine ? "[READ-ONLY]" : "[READ-WRITE]"} OK SELECT\r\n`);
                             break;
+                        }
                         case "CREATE":
                             writeResponse({
                                 tag: tag,
@@ -865,6 +976,9 @@ export class IMAPServer {
                             break;
                         }
                         case "LSUB": {
+                            // internal_state
+                            // args[]
+
                             const boxes = await getBoxes();
 
                             // tbd: \Noinferiors(?)
@@ -881,45 +995,132 @@ export class IMAPServer {
                             });
                             break;
                         }
-                        case "STATUS":
-                            socket.write(`* STATUS ${args[0]} (MESSAGES 10 RECENT 1 UNSEEN 1)\r\n`);
+                        case "STATUS": {
+                            if (internal_state == IMAPState.unauth) {
+                                writeResponse({ tag: tag, type: "BAD", text: `authentication required` });
+                                break;
+                            }
+                            if (args.length !== 2) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 2)` });
+                                break;
+                            }
+                            if (!isnstring(args[0])) {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD",
+                                    text: "invalid mailbox name"
+                                });
+                                break;
+                            }
+                            if (!(args[1] instanceof Array) || args[1].filter(e => typeof e !== "string").length) {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "BAD",
+                                    text: "invalid status data items"
+                                });
+                                break;
+                            }
+                            const mailbox_name: string = astring(args[0]).toUpperCase() == "INBOX" ? "INBOX" : astring(args[0]);
+
+                            const boxes = await getBoxes();
+                            if (!(boxes.filter(box => box.name == mailbox_name).length)) {
+                                writeResponse({
+                                    tag: tag,
+                                    type: "NO",
+                                    text: "mailbox unavailable"
+                                });
+                                conn.selected = null;
+                                internal_state = IMAPState.auth;
+                                break;
+                            }
+                            const box: IMAPBox = boxes.filter(box => box.name == mailbox_name)[0];
+
+                            const status: string[] = [];
+                            for (const data_item of [...new Set((args[1] as string[]).map(e => e.toUpperCase()))]) {
+                                switch (data_item) {
+                                    case "MESSAGES":
+                                        status.push(`MESSAGES ${box.messages.count}`);
+                                        break;
+                                    case "RECENT":
+                                        status.push(`RECENT ${box.messages.recent_count ?? box.messages.count}`);
+                                        break;
+                                    case "UIDNEXT":
+                                        // tbd
+                                        break;
+                                    case "UIDVALIDITY":
+                                        // tbd
+                                        break;
+                                    case "UNSEEN":
+                                        status.push(`UNSEEN ${box.messages.unread_count}`);
+                                        break;
+                                }
+                            }
+
+                            socket.write(`* STATUS ${args[0]} (${status.join(" ")})\r\n`);
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
+                        }
                         case "APPEND":
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
+
+                            // tbd, will be an interesting one to implement, probably will require EWS
                             break;
                         case "CHECK":
-                            writeResponse({
-                                tag: tag,
-                                type: "OK"
-                            });
+                            // internal_state ig
+                            if (args.length !== 0) {
+                                writeResponse({ tag: tag, type: "BAD", text: `unexpected amount of arguments (${args.length} instead of 0)` });
+                                break;
+                            }
+
+                            writeResponse({ tag: tag, type: "OK", text: `${command} completed` });
                             break;
                         case "CLOSE":
+                            // internal_state
+                            // args[]
+
+                            /*
+                             The CLOSE command permanently removes all messages that have the
+                             \Deleted flag set from the currently selected mailbox, and returns
+                             to the authenticated state from the selected state.  No untagged
+                             EXPUNGE responses are sent.
+
+
+                             seems basically expunge without responses, and added benifit of unselecting the box
+                            */
                             internal_state = IMAPState.auth;
+                            conn.selected = null;
+
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
                         case "EXPUNGE":
+                            // tbd
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
                         case "SEARCH":
+                            // tbd
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
                         case "FETCH":
+                            // to be completed
+                            // macros
+                            // sid/uid
+                            // <<partial>> (in parser)
+
                             console.log("is_uid", _is_uid);
                             const sequence_set = args.shift();
                             // console.log(sequence_set);
@@ -943,13 +1144,66 @@ export class IMAPServer {
                             }).flat();
                             console.log(seq);
 
+                            let messageDetails: IMAPMessageDetails[];
+                            if (details.includes("RFC822.SIZE")) messageDetails = await handlers.getMessageDetails({
+                                connection: connection,
+                            }, { resolve: () => { } }) as IMAPMessageDetails[];
+                            else messageDetails = [];
+
+                            // if (!details.includes("RFC822.SIZE")) {
                             for (const se of seq) {
                                 if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
+                                else if (details[2] instanceof Set && [...details[2]][0] == "BODY") {
+                                    const messageDetail = messageDetails[se - 1];
+                                    if (!messageDetail) { /* literally nothing */ }
+                                    else {
+                                        const eml = await handlers.getMessage({
+                                            connection,
+                                            uid: messageDetail.uid
+                                        }, {
+                                            resolve: () => { }
+                                        }) as string;
+
+                                        const emlBuffer = Buffer.from(eml);
+                                        socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[] {${emlBuffer.byteLength}}\r\n`);
+                                        socket.write(emlBuffer);
+                                        socket.write(`)\r\n`);
+                                    }
+                                }
                                 else {
-                                            /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
+                                    // /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
                                     // break;
+
+                                    const messageDetail = messageDetails[se - 1];
+                                    if (!messageDetail) { /* literally nothing */ }
+                                    // if (!messageDetail) owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
+                                    else {
+                                        const messageHeaders = Buffer.concat([
+                                            `From: ${messageDetail.from.name} <${messageDetail.from.address}>\r\n`,
+                                            `To: ${messageDetail.to[0]?.name ?? "name"} <${messageDetail.to[0]?.address ?? "email@example.com"}>\r\n`,
+                                            `Cc:\r\n`,
+                                            `Bcc:\r\n`,
+                                            `Subject: ${messageDetail.subject}\r\n`,
+                                            `Date: ${messageDetail.date.toUTCString().replace(/GMT$/, "+0000")}\r\n`,
+                                            `Message-ID: ${messageDetail.internet_message_id}\r\n`,
+                                            `Priority: normal\r\n`,
+                                            `X-Priority: 3\r\n`,
+                                            `References:\r\n`,
+                                            `Newsgroups:\r\n`,
+                                            `In-Reply-To:\r\n`,
+                                            `Content-Type: text/plain; charset="UTF-8"\r\n`,
+                                            `Reply-To: Alice Example <alice@example.org>\r\n`,
+
+                                            `\r\n`
+                                        ].map(e => Buffer.from(e)));
+                                        socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {${messageHeaders.byteLength}}\r\n`);
+                                        socket.write(messageHeaders);
+                                        socket.write(`)\r\n`);
+                                    }
                                 }
                             }
+                            // } else {
+                            // }
 
 
                             writeResponse({
@@ -958,116 +1212,28 @@ export class IMAPServer {
                             });
                             break;
                         case "STORE":
+                            // internal_state
+                            // args[]
+
+                            // seq_set
+                            // change flags (+/-)FLAGS(.SILENT)
+
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
                         case "COPY":
+                            // internal_state
+                            // args[]
+
+                            // seq_set
+
                             writeResponse({
                                 tag: tag,
                                 type: "OK"
                             });
                             break;
-                        // case "UID":
-                        //     // let g = args.shift()?.toLowerCase();
-                        //     // console.log(args);
-
-                        //     const type = args.shift();
-                        //     // console.log(type);
-                        //     if (typeof type !== "string") {
-                        //         writeResponse({
-                        //             tag: tag,
-                        //             type: "BAD"
-                        //         });
-                        //         break;
-                        //     }
-
-                        //     switch (type.toLowerCase()) {
-                        //         case "copy":
-                        //             // copy implementation
-                        //             writeResponse({
-                        //                 tag: tag,
-                        //                 type: "OK"
-                        //             });
-                        //             break;
-                        //         case "fetch":
-                        //             const sequence_set = args.shift();
-                        //             // console.log(sequence_set);
-
-                        //             const details = args.shift();
-                        //             if (!(details instanceof Array) || (typeof sequence_set !== "string" && typeof sequence_set !== "number")) {
-                        //                 writeResponse({
-                        //                     tag: tag,
-                        //                     type: "BAD"
-                        //                 });
-                        //                 break;
-                        //             }
-
-                        //             const seq = sequence_set.toString().split(",").map(e => {
-                        //                 if (e.includes(":")) {
-                        //                     const g = e.split(":").map(e => e == "*" ? 10 : +e);
-                        //                     return Array(g[1] - g[0] + 1).fill(undefined).map((_, f) => f + g[0]);
-                        //                 } else {
-                        //                     return +e;
-                        //                 }
-                        //             }).flat();
-                        //             console.log(seq);
-
-                        //             for (const se of seq) {
-                        //                 if (!details.includes("RFC822.SIZE")) socket.write(`* ${se} FETCH (FLAGS (\\Seen) UID ${se})\r\n`);
-                        //                 else {
-                        //                     /* socket.write */owrite(`* ${se} FETCH (FLAGS (\\Seen) UID ${se} RFC822.SIZE 2345 BODY[HEADER.FIELDS (From To Cc Bcc Subject Date Message-ID Priority X-Priority References Newsgroups In-Reply-To Content-Type Reply-To)] {347}\r\nFrom: Alice Example <alice@example.org>\r\nTo: Bob Example <bob@example.com>\r\nCc:\r\nBcc:\r\nSubject: Project kickoff\r\nDate: Fri, 15 Aug 2025 10:12:34 +0200\r\nMessage-ID: <msg1@example.org>\r\nPriority: normal\r\nX-Priority: 3\r\nReferences:\r\nNewsgroups:\r\nIn-Reply-To:\r\nContent-Type: text/plain; charset="UTF-8"\r\nReply-To: Alice Example <alice@example.org>\r\n\r\n)\r\n`);
-                        //                     // break;
-                        //                 }
-                        //             }
-
-
-                        //             writeResponse({
-                        //                 tag: tag,
-                        //                 type: "OK"
-                        //             });
-                        //             break;
-                        //         case "store":
-                        //             writeResponse({
-                        //                 tag: tag,
-                        //                 type: "OK"
-                        //             });
-                        //             break;
-                        //         case "search":
-                        //             writeResponse({
-                        //                 tag: tag,
-                        //                 type: "OK"
-                        //             });
-                        //             break;
-                        //         default:
-                        //             writeResponse({
-                        //                 tag: tag,
-                        //                 type: "BAD"
-                        //             });
-                        //             break;
-                        //     }
-                        //     break;
-
-                        // case ""
-
-
-                        // case "NOOP":
-                        //     socket.write(`${tag} OK OK\r\n`);
-                        //     break;
-                        // case "LOGOUT":
-                        //     socket.write(`* BYE BYE\r\n`);
-                        //     return socket.end();
-                        //     break;
-                        // case "SELECT":
-                        //     socket.write(`* 2 EXISTS\r\n`);
-                        //     socket.write(`* 1 RECENT\r\n`);
-                        //     socket.write(`* OK [UIDVALIDITY 100] UIDs valid\r\n`);
-                        //     socket.write(`* OK [UIDNEXT 5] Predicted next UID\r\n`);
-                        //     socket.write(`* FLAGS (\\Seen \\Deleted)\r\n`);
-                        //     socket.write(`${tag} OK OK\r\n`);
-                        //     conn.selected = "INBOX";
-                        //     break;
                         default:
                             socket.write(`${tag} BAD BAD\r\n`);
                     }
